@@ -1,0 +1,34 @@
+mesh:
+  callsign: "KD9YQK-1"
+  mesh_dest_callsign: "QMESH-0"
+
+kiss:
+  transport: "tcp"        # "tcp" or "serial"
+  tcp_host: "127.0.0.1"
+  tcp_port: 8001
+  serial_port: "/dev/ttyUSB0"
+  serial_baud: 1200
+  reconnect_base_delay: 5.0
+  reconnect_max_delay: 60.0
+  tx_queue_size: 1000
+
+routing:
+  ogm_interval_seconds: 10.0
+  ogm_ttl: 5
+  route_expiry_seconds: 120.0
+  neighbor_expiry_seconds: 60.0
+  data_seen_expiry_seconds: 30.0   # NEW: for the dedup cache
+
+security:
+  enable_encryption: false         # must stay false on ham bands
+  key_hex: null                    # or "001122...ff" if you ever use it off-air
+
+chat:
+  db_path: "chat_logs.sqlite"
+  peers:
+    bob:
+      node_id_hex: "0011223344556677"
+      nick: "Bob"
+    alice:
+      node_id_hex: "1122334455667788"
+      nick: "Alice"
