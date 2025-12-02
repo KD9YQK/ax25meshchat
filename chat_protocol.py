@@ -1,305 +1,143 @@
-# chat_client.py
+# chat_protocol.py
 
 from __future__ import annotations
 
-import time
-from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Tuple
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Any
+import json
 
-from mesh_config import (
-    MeshNodeConfig,
-    KISSConnectionConfig,
-    TransportType,
-)
-from kiss_link import KISSClient
-from mesh_node import MeshNode
-from chat_store import ChatStore
-from chat_protocol import (
-    ChatMessage,
-    CHAT_TYPE_MESSAGE,
-    CHAT_TYPE_SYNC_REQUEST,
-    CHAT_TYPE_SYNC_RESPONSE,
-    encode_chat_message,
-    decode_chat_message,
-    encode_sync_request,
-    parse_sync_request,
-    encode_sync_response,
-    parse_sync_response,
-)
+CHAT_VERSION = 1
+
+CHAT_TYPE_MESSAGE = 1
+CHAT_TYPE_SYNC_REQUEST = 5
+CHAT_TYPE_SYNC_RESPONSE = 6
 
 
 @dataclass
-class ChatPeer:
-    node_id: bytes
+class ChatMessage:
+    msg_type: int
+    channel: str
     nick: str
+    text: str
 
 
-@dataclass
-class MeshChatConfig:
-    mesh_node_config: MeshNodeConfig
-    db_path: str
-    peers: Dict[str, ChatPeer] = field(default_factory=dict)
-
-
-class MeshChatClient:
+def encode_chat_message(msg: ChatMessage) -> bytes:
     """
-    IRC-style chat client on top of MeshNode with:
-
-    - Persistent history via SQLite
-    - Timestamped messages
-    - Sync of chatrooms via SYNC_REQUEST / SYNC_RESPONSE
+    Basic chat message encoder: [ver][type][chan_len][nick_len][chan][nick][text]
     """
+    channel_bytes = msg.channel.encode("utf-8")
+    nick_bytes = msg.nick.encode("utf-8")
+    text_bytes = msg.text.encode("utf-8")
 
-    def __init__(
-        self,
-        config: MeshChatConfig,
-        on_chat_message: Callable[[ChatMessage, bytes, float], None],
-    ) -> None:
-        """
-        on_chat_message(ChatMessage, origin_id, ts)
-        """
-        self._config = config
-        self._on_chat_message = on_chat_message
-        self._nick = config.mesh_node_config.callsign  # default nick
+    chan_len = len(channel_bytes)
+    nick_len = len(nick_bytes)
 
-        self._store = ChatStore(config.db_path)
+    if chan_len > 255:
+        raise ValueError("channel name too long")
+    if nick_len > 255:
+        raise ValueError("nick too long")
 
-        def kiss_factory(rx_callback):
-            kiss_cfg = config.mesh_node_config.kiss_config
-            if kiss_cfg is None:
-                kiss_cfg = KISSConnectionConfig(
-                    transport=TransportType.TCP,
-                    tcp_host="127.0.0.1",
-                    tcp_port=8001,
-                )
-            return KISSClient(kiss_cfg, rx_callback)
+    header = bytearray(4)
+    header[0] = CHAT_VERSION
+    header[1] = msg.msg_type
+    header[2] = chan_len
+    header[3] = nick_len
 
-        self._mesh_node = MeshNode(
-            config=config.mesh_node_config,
-            kiss_client_factory=kiss_factory,
-            app_data_callback=self._on_mesh_app_data,
-        )
+    payload = bytes(header) + channel_bytes + nick_bytes + text_bytes
+    return payload
 
-    # --------------------------------------------------------------
-    # Lifecycle
-    # --------------------------------------------------------------
 
-    def start(self) -> None:
-        self._mesh_node.start()
+def decode_chat_message(data: bytes) -> Optional[ChatMessage]:
+    if len(data) < 4:
+        return None
 
-    def stop(self) -> None:
-        self._mesh_node.stop()
-        self._store.close()
+    version = data[0]
+    msg_type = data[1]
+    chan_len = data[2]
+    nick_len = data[3]
 
-    def set_nick(self, nick: str) -> None:
-        self._nick = nick
+    if version != CHAT_VERSION:
+        return None
 
-    # --------------------------------------------------------------
-    # Sending messages
-    # --------------------------------------------------------------
+    header_len = 4
+    needed = header_len + chan_len + nick_len
+    if len(data) < needed:
+        return None
 
-    def send_message_to_peer(
-        self,
-        peer_nick: str,
+    channel_bytes = data[header_len: header_len + chan_len]
+    nick_bytes = data[header_len + chan_len: header_len + chan_len + nick_len]
+    text_bytes = data[header_len + chan_len + nick_len:]
+
+    channel = channel_bytes.decode("utf-8", errors="replace")
+    nick = nick_bytes.decode("utf-8", errors="replace")
+    text = text_bytes.decode("utf-8", errors="replace")
+
+    return ChatMessage(
+        msg_type=msg_type,
+        channel=channel,
+        nick=nick,
+        text=text,
+    )
+
+
+# --------------------- SYNC helpers ---------------------
+
+
+def encode_sync_request(channel: str, nick: str, since_ts: float) -> bytes:
+    """
+    SYNC_REQUEST: text = JSON {"since_ts": float}
+    """
+    payload = {
+        "since_ts": since_ts,
+    }
+    msg = ChatMessage(
+        msg_type=CHAT_TYPE_SYNC_REQUEST,
+        channel=channel,
+        nick=nick,
+        text=json.dumps(payload),
+    )
+    return encode_chat_message(msg)
+
+
+def parse_sync_request(msg: ChatMessage) -> Optional[float]:
+    """
+    Returns since_ts or None on error.
+    """
+    try:
+        obj = json.loads(msg.text)
+    except json.JSONDecodeError:
+        return None
+    if "since_ts" not in obj:
+        return None
+    value = obj["since_ts"]
+    if not isinstance(value, (float, int)):
+        return None
+    return float(value)
+
+
+def encode_sync_response(
         channel: str,
-        text: str,
-    ) -> None:
-        peer = self._config.peers.get(peer_nick)
-        if peer is None:
-            raise ValueError(f"Unknown peer nickname: {peer_nick}")
-        self.send_message_to_node(peer.node_id, channel, text)
+        nick: str,
+        records: List[Dict[str, Any]],
+) -> bytes:
+    """
+    SYNC_RESPONSE: text = JSON list of records:
+      {"origin_id_hex": str, "seqno": int, "nick": str, "text": str, "ts": float}
+    """
+    msg = ChatMessage(
+        msg_type=CHAT_TYPE_SYNC_RESPONSE,
+        channel=channel,
+        nick=nick,
+        text=json.dumps(records),
+    )
+    return encode_chat_message(msg)
 
-    def send_message_to_node(
-        self,
-        dest_node_id: bytes,
-        channel: str,
-        text: str,
-    ) -> None:
-        msg = ChatMessage(
-            msg_type=CHAT_TYPE_MESSAGE,
-            channel=channel,
-            nick=self._nick,
-            text=text,
-        )
-        payload = encode_chat_message(msg)
-        self._mesh_node.send_application_data(dest_node_id, payload)
-        # Log locally as "sent"
-        now = time.time()
-        self._store.add_message(
-            origin_id=self._mesh_node._node_id,  # you may want a public accessor
-            seqno=0,  # we don't know data_seq here; optional local-only marker
-            channel=channel,
-            nick=self._nick,
-            text=text,
-            ts=now,
-        )
 
-    # --------------------------------------------------------------
-    # Sync API
-    # --------------------------------------------------------------
-
-    def request_sync(
-        self,
-        dest_node_id: bytes,
-        channel: str,
-        since_ts: float,
-    ) -> None:
-        """
-        Ask a peer for messages in `channel` after `since_ts`.
-        """
-        payload = encode_sync_request(channel=channel, nick=self._nick, since_ts=since_ts)
-        self._mesh_node.send_application_data(dest_node_id, payload)
-
-    def request_sync_from_peer(
-        self,
-        peer_nick: str,
-        channel: str,
-        since_ts: float,
-    ) -> None:
-        peer = self._config.peers.get(peer_nick)
-        if peer is None:
-            raise ValueError(f"Unknown peer nickname: {peer_nick}")
-        self.request_sync(peer.node_id, channel, since_ts)
-
-    def get_local_history(
-        self,
-        channel: str,
-        limit: int = 100,
-    ) -> List[Tuple[bytes, int, str, str, str, float]]:
-        """
-        Return local history for UI: list of
-          (origin_id, seqno, channel, nick, text, ts)
-        """
-        return self._store.get_recent_messages(channel, limit)
-
-    # --------------------------------------------------------------
-    # Mesh app-data callback
-    # --------------------------------------------------------------
-
-    def _on_mesh_app_data(
-        self,
-        origin_id: bytes,
-        _dest_id: bytes,
-        data_seqno: int,
-        payload: bytes,
-    ) -> None:
-        msg = decode_chat_message(payload)
-        if msg is None:
-            return
-
-        now = time.time()
-
-        if msg.msg_type == CHAT_TYPE_MESSAGE:
-            self._handle_incoming_chat_message(origin_id, data_seqno, msg, now)
-        elif msg.msg_type == CHAT_TYPE_SYNC_REQUEST:
-            self._handle_sync_request(origin_id, data_seqno, msg)
-        elif msg.msg_type == CHAT_TYPE_SYNC_RESPONSE:
-            self._handle_sync_response(origin_id, data_seqno, msg, now)
-
-    def _handle_incoming_chat_message(
-        self,
-        origin_id: bytes,
-        data_seqno: int,
-        msg: ChatMessage,
-        ts: float,
-    ) -> None:
-        """
-        Store and forward to UI.
-        """
-        self._store.add_message(
-            origin_id=origin_id,
-            seqno=data_seqno,
-            channel=msg.channel,
-            nick=msg.nick,
-            text=msg.text,
-            ts=ts,
-        )
-        self._on_chat_message(msg, origin_id, ts)
-
-    def _handle_sync_request(
-        self,
-        origin_id: bytes,
-        _data_seqno: int,
-        msg: ChatMessage,
-    ) -> None:
-        since_ts = parse_sync_request(msg)
-        if since_ts is None:
-            return
-
-        records_raw = self._store.get_messages_since(
-            channel=msg.channel,
-            since_ts=since_ts,
-            limit=100,
-        )
-
-        records: List[Dict[str, object]] = []
-        for origin_bytes, seqno, channel, nick, text, ts in records_raw:
-            record = {
-                "origin_id_hex": origin_bytes.hex(),
-                "seqno": int(seqno),
-                "nick": nick,
-                "text": text,
-                "ts": float(ts),
-            }
-            records.append(record)
-
-        response_payload = encode_sync_response(
-            channel=msg.channel,
-            nick=self._nick,
-            records=records,
-        )
-        # respond directly to requester
-        self._mesh_node.send_application_data(origin_id, response_payload)
-
-    def _handle_sync_response(
-        self,
-        _origin_id: bytes,
-        _data_seqno: int,
-        msg: ChatMessage,
-        _now: float,
-    ) -> None:
-        records = parse_sync_response(msg)
-        if records is None:
-            return
-
-        for record in records:
-            origin_hex = record.get("origin_id_hex")
-            seqno_val = record.get("seqno")
-            nick_val = record.get("nick")
-            text_val = record.get("text")
-            ts_val = record.get("ts")
-
-            if not isinstance(origin_hex, str):
-                continue
-            if not isinstance(seqno_val, int):
-                continue
-            if not isinstance(nick_val, str):
-                continue
-            if not isinstance(text_val, str):
-                continue
-            if not isinstance(ts_val, (float, int)):
-                continue
-
-            origin_bytes = bytes.fromhex(origin_hex)
-            seqno_int = seqno_val
-            ts_float = float(ts_val)
-
-            if self._store.has_message(origin_bytes, seqno_int):
-                continue
-
-            self._store.add_message(
-                origin_id=origin_bytes,
-                seqno=seqno_int,
-                channel=msg.channel,
-                nick=nick_val,
-                text=text_val,
-                ts=ts_float,
-            )
-
-            chat_msg = ChatMessage(
-                msg_type=CHAT_TYPE_MESSAGE,
-                channel=msg.channel,
-                nick=nick_val,
-                text=text_val,
-            )
-            self._on_chat_message(chat_msg, origin_bytes, ts_float)
+def parse_sync_response(msg: ChatMessage) -> Optional[List[Dict[str, Any]]]:
+    try:
+        obj = json.loads(msg.text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(obj, list):
+        return None
+    return obj
