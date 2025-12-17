@@ -8,10 +8,9 @@ from typing import Callable, Dict, List, Tuple
 
 from mesh_config import (
     MeshNodeConfig,
-    KISSConnectionConfig,
-    TransportType,
+    ArdopConnectionConfig,
 )
-from kiss_link import KISSClient
+from ardop_link import ArdopLinkClient
 from mesh_node import MeshNode
 from chat_store import ChatStore
 from chat_protocol import (
@@ -64,19 +63,15 @@ class MeshChatClient:
 
         self._store = ChatStore(config.db_path)
 
-        def kiss_factory(rx_callback):
-            kiss_cfg = config.mesh_node_config.kiss_config
-            if kiss_cfg is None:
-                kiss_cfg = KISSConnectionConfig(
-                    transport=TransportType.TCP,
-                    tcp_host="127.0.0.1",
-                    tcp_port=8001,
-                )
-            return KISSClient(kiss_cfg, rx_callback)
+        def link_client_factory(rx_callback):
+            ardop_cfg = config.mesh_node_config.ardop_config
+            if ardop_cfg is None:
+                ardop_cfg = ArdopConnectionConfig()
+            return ArdopLinkClient(ardop_cfg, rx_callback, name="mesh-ardop-link")
 
         self._mesh_node = MeshNode(
             config=config.mesh_node_config,
-            kiss_client_factory=kiss_factory,
+            link_client_factory=link_client_factory,
             app_data_callback=self._on_mesh_app_data,
         )
 

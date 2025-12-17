@@ -1,78 +1,71 @@
 """
 Configuration and enums for the VHF mesh stack.
+
+This project is now ARDOP-only at the link layer. All KISS/AX.25
+configuration has been removed in favor of a simple ARDOP TCP
+connection config.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
 from typing import Optional
 
 
-class TransportType(str, Enum):
-    SERIAL = "serial"
-    TCP = "tcp"
-
-
 @dataclass
-class KISSConnectionConfig:
+class ArdopConnectionConfig:
+    """Configuration for the ARDOP TCP link.
+
+    This describes how the mesh node connects to the ARDOP TNC or modem
+    process that exposes a TCP byte-stream interface.
+
+    - host: hostname or IP of the ARDOP TNC
+    - port: TCP port for the TNC data stream
+    - reconnect_base_delay: initial reconnect backoff, in seconds
+    - reconnect_max_delay: maximum reconnect backoff, in seconds
+    - tx_queue_size: maximum number of queued frames waiting to be sent
     """
-    Configuration for a KISS3 connection.
-    """
 
-    transport: TransportType
+    host: str = "127.0.0.1"
+    port: int = 8515
 
-    # Serial configuration
-    serial_port: str = "/dev/ttyUSB0"
-    serial_baud: int = 1200
-
-    # TCP configuration (e.g. Direwolf KISS TCP)
-    tcp_host: str = "127.0.0.1"
-    tcp_port: int = 8001
-
-    # Reconnect behavior
     reconnect_base_delay: float = 5.0
     reconnect_max_delay: float = 60.0
 
-    # TX queue
     tx_queue_size: int = 1000
 
 
 @dataclass
-class MeshSecurityConfig:
-    """
-    Optional security settings.
-
-    NOTE: Enabling encryption on amateur bands may violate local regulations.
-    Ensure you understand and comply with your jurisdiction's rules.
-    """
-
-    enable_encryption: bool = False
-    # 32 bytes for AES-256 (if using the default AES-GCM implementation).
-    key: Optional[bytes] = None
-
-
-@dataclass
 class MeshRoutingConfig:
-    """
-    Routing / BATMAN-lite behavior.
-    """
+    """Routing and neighbor behavior."""
 
-    ogm_interval_seconds: float = 10.0
-    ogm_ttl: int = 5
+    ogm_interval_seconds: float = 600.0  # how often to send OGMs
+    ogm_ttl: int = 5                     # hop limit for OGMs
     route_expiry_seconds: float = 120.0
     neighbor_expiry_seconds: float = 60.0
     data_seen_expiry_seconds: float = 30.0
 
 
 @dataclass
+class MeshSecurityConfig:
+    """Security / crypto configuration.
+
+    NOTE: On amateur radio you must keep `enable_encryption` false.
+    """
+
+    enable_encryption: bool = False
+    key: Optional[bytes] = None
+
+
+@dataclass
 class MeshNodeConfig:
-    """
-    Overall node configuration.
-    """
+    """Overall node configuration."""
 
     callsign: str
     mesh_dest_callsign: str = "QMESH-0"
-    kiss_config: KISSConnectionConfig | None = None
+
+    # ARDOP link-layer connection settings
+    ardop_config: Optional[ArdopConnectionConfig] = None
+
     routing_config: MeshRoutingConfig = MeshRoutingConfig()
     security_config: MeshSecurityConfig = MeshSecurityConfig()

@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """
-Tkinter mesh chat GUI with IRC-style tabs.
+Mesh Chat GUI (wxPython version, no AUI manager)
 
-- Uses ttk.Notebook for tabs:
-    - First tab: "Status"
-    - Additional tabs: one per chat channel (#general, #random, ...)
-- BackendInterface is satisfied either by:
-    - FakeBackend (for testing)
-    - MeshChatBackend (real RF mesh via MeshChatClient)
+Layout:
+- Top: SplitterWindow
+    - Left: Nodes / Channels list
+    - Right: Tabbed chat (AuiNotebook with close buttons)
+- Bottom: Input row (separate textbox + Send button) spanning full width
+- Status bar at the bottom
+
+Backend contract (same as Tkinter version):
+- backend: BackendInterface
+    - get_ui_queue() -> queue.Queue[UIEvent]
+    - send_message(channel: str, text: str) -> None
+    - shutdown() -> None
 """
 
 from __future__ import annotations
@@ -15,38 +21,41 @@ from __future__ import annotations
 import queue
 import threading
 import time
+from typing import Optional
 
-import tkinter as tk
-from tkinter import ttk
+import wx
+import wx.aui as aui
 
-# If mesh_backend.py is in same directory:
 from mesh_backend import (
     BackendInterface,
     ChatEvent,
     StatusEvent,
     UIEvent,
+    MeshChatBackend,
 )
 
 
-# ============================================================
-# Optional local FakeBackend for offline testing
-# ============================================================
+# =====================================================================
+# Simple FakeBackend for local testing (no RF, no mesh)
+# =====================================================================
 
 class FakeBackend(BackendInterface):
     """
-    Simple fake backend:
+    Simple in-memory backend that:
 
-    - Echoes sent messages back into the UI queue.
-    - Periodically emits a StatusEvent.
+    - Accepts send_message() calls.
+    - Periodically emits StatusEvent heartbeats.
     """
 
     def __init__(self, nick: str = "Me", default_channel: str = "#general") -> None:
-        self.nick = nick
-        self.default_channel = default_channel
+        self._nick = nick
+        self._default_channel = default_channel
         self._ui_queue: queue.Queue[UIEvent] = queue.Queue()
         self._running = True
+
         self._status_thread = threading.Thread(
             target=self._status_loop,
+            name="FakeBackendStatus",
             daemon=True,
         )
         self._status_thread.start()
@@ -55,319 +64,327 @@ class FakeBackend(BackendInterface):
         return self._ui_queue
 
     def send_message(self, channel: str, text: str) -> None:
-        ts = time.time()
-        event = ChatEvent(
-            channel=channel,
-            nick=self.nick,
-            text=text,
-            timestamp=ts,
-            origin_id=b"FAKE_ORIGIN",
-        )
-        self._ui_queue.put(event)
-
-    def _status_loop(self) -> None:
-        while self._running:
-            time.sleep(30.0)
-            if not self._running:
-                return
-            self._ui_queue.put(StatusEvent(text="Fake mesh backend heartbeat..."))
+        # For fake backend, just log to status so you see activity.
+        self._ui_queue.put(StatusEvent(text=f"Fake send to {channel}: {text!r}"))
 
     def shutdown(self) -> None:
         self._running = False
 
+    def _status_loop(self) -> None:
+        while self._running:
+            time.sleep(10.0)
+            if not self._running:
+                return
+            self._ui_queue.put(StatusEvent(text="Fake backend heartbeat..."))
 
-# ============================================================
-# Tkinter GUI with tabs
-# ============================================================
 
-class ChatUI(ttk.Frame):
+# =====================================================================
+# Main Application Frame
+# =====================================================================
+
+class ChatFrame(wx.Frame):
     """
-    Main chat UI frame.
+    Main wxPython frame:
 
-    Layout:
-        [ Notebook Tabs: Status | #general | #random | ... ]
-        [ text area (per tab) + scrollbar ]
-        [ input entry | Send button ]
-        [ status bar ]
+    - splitter: left node list, right notebook
+    - notebook: tabs per channel/DM
+    - bottom input row
     """
 
     POLL_INTERVAL_MS = 100
-    STATUS_TAB_NAME = "Status"
 
-    def __init__(
-            self,
-            master: tk.Misc,
-            backend: BackendInterface,
-            initial_channels: list[str] | None = None,
-            default_channel: str = "#general",
-            **kwargs,
-    ) -> None:
-        super().__init__(master, **kwargs)
+    def __init__(self, backend: BackendInterface) -> None:
+        super().__init__(None, title="ARDOP Mesh Chat", size=wx.Size(1000, 700))
         self.backend = backend
-        self.ui_queue = backend.get_ui_queue()
+        self.ui_queue: queue.Queue[UIEvent] = backend.get_ui_queue()
+        self._status_tab_name = "Status"
 
-        if initial_channels is None:
-            initial_channels = [default_channel, "#random"]
+        self._build_ui()
 
-        self.default_channel = default_channel
-        self.channels = list(initial_channels)
+        # Timer for backend queue polling
+        self._timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self.on_timer, self._timer)
+        self._timer.Start(self.POLL_INTERVAL_MS)
 
-        # Map channel name -> Text widget
-        self.text_widgets: dict[str, tk.Text] = {}
+        self.Bind(wx.EVT_CLOSE, self.on_close)
 
-        self._build_widgets()
-        self._layout_widgets()
+    # -----------------------------------------------------------------
+    # UI construction
+    # -----------------------------------------------------------------
 
-        # Start polling queue
-        self.after(self.POLL_INTERVAL_MS, self._poll_ui_queue)
+    def _build_ui(self) -> None:
+        main_sizer = wx.BoxSizer(wx.VERTICAL)
 
-    # ------------------------------
-    # Widget construction
-    # ------------------------------
+        # =======================
+        # Top: Splitter
+        # =======================
+        splitter = wx.SplitterWindow(self, style=wx.SP_LIVE_UPDATE)
 
-    def _build_widgets(self) -> None:
-        # Notebook for tabs
-        self.notebook = ttk.Notebook(self)
+        # Left panel: nodes / channels
+        left_panel = wx.Panel(splitter)
+        left_sizer = wx.BoxSizer(wx.VERTICAL)
 
-        # Status tab
-        self.status_frame = ttk.Frame(self.notebook)
-        status_text = self._create_text_widget(self.status_frame)
-        self.text_widgets[self.STATUS_TAB_NAME] = status_text
-        self.notebook.add(self.status_frame, text=self.STATUS_TAB_NAME)
-
-        # Channel tabs
-        for ch in self.channels:
-            self._create_channel_tab(ch)
-
-        # Input area
-        self.input_frame = ttk.Frame(self)
-        self.input_var = tk.StringVar()
-        self.input_entry = ttk.Entry(self.input_frame, textvariable=self.input_var)
-        self.send_button = ttk.Button(
-            self.input_frame,
-            text="Send",
-            command=self._on_send_clicked,
+        label = wx.StaticText(left_panel, label="Nodes / Channels")
+        self.node_list = wx.ListCtrl(
+            left_panel,
+            style=wx.LC_REPORT | wx.LC_SINGLE_SEL,
         )
-        self.input_entry.bind("<Return>", self._on_enter_pressed)
+        self.node_list.InsertColumn(0, "Name", width=200)
 
-        # Status bar
-        self.status_var = tk.StringVar(value="Disconnected")
-        self.status_label = ttk.Label(self, textvariable=self.status_var, anchor="w")
+        # Demo entries; real app will populate from mesh/chat state
+        self.node_list.InsertItem(0, "#general")
+        self.node_list.InsertItem(1, "#random")
+        self.node_list.InsertItem(2, "@K0TEST-7")
 
-    def _layout_widgets(self) -> None:
-        self.rowconfigure(0, weight=1)
-        self.columnconfigure(0, weight=1)
+        self.node_list.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.on_node_activated)
 
-        # Notebook
-        self.notebook.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+        left_sizer.Add(label, 0, wx.EXPAND | wx.ALL, 4)
+        left_sizer.Add(self.node_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 4)
+        left_panel.SetSizer(left_sizer)
 
-        # Input area
-        self.input_frame.grid(row=1, column=0, sticky="ew", padx=5, pady=(0, 5))
-        self.input_frame.columnconfigure(0, weight=1)
-        self.input_entry.grid(row=0, column=0, sticky="ew")
-        self.send_button.grid(row=0, column=1, padx=(5, 0))
+        # Right panel: notebook
+        right_panel = wx.Panel(splitter)
+        right_sizer = wx.BoxSizer(wx.VERTICAL)
 
-        # Status bar
-        self.status_label.grid(row=2, column=0, sticky="ew", padx=5, pady=(0, 5))
-
-    # ------------------------------
-    # Tab & text helpers
-    # ------------------------------
-
-    @staticmethod
-    def _create_text_widget(parent: ttk.Frame) -> tk.Text:
-        frame = ttk.Frame(parent)
-        frame.pack(fill="both", expand=True)
-
-        text = tk.Text(
-            frame,
-            wrap="word",
-            height=20,
-            state="disabled",
+        self.notebook = aui.AuiNotebook(
+            right_panel,
+            style=(
+                aui.AUI_NB_DEFAULT_STYLE
+                | aui.AUI_NB_TAB_MOVE
+                | aui.AUI_NB_CLOSE_ON_ACTIVE_TAB
+            ),
         )
-        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
-        text.configure(yscrollcommand=scrollbar.set)
+        self.notebook.Bind(aui.EVT_AUINOTEBOOK_PAGE_CLOSE, self.on_tab_close)
 
-        frame.rowconfigure(0, weight=1)
-        frame.columnconfigure(0, weight=1)
+        right_sizer.Add(self.notebook, 1, wx.EXPAND)
+        right_panel.SetSizer(right_sizer)
 
-        text.grid(row=0, column=0, sticky="nsew")
-        scrollbar.grid(row=0, column=1, sticky="ns")
+        splitter.SplitVertically(left_panel, right_panel, sashPosition=220)
+        splitter.SetMinimumPaneSize(150)
 
-        return text
+        main_sizer.Add(splitter, 1, wx.EXPAND)
 
-    def _create_channel_tab(self, channel: str) -> None:
-        if channel in self.text_widgets:
+        # =======================
+        # Bottom: input row
+        # =======================
+        bottom_panel = wx.Panel(self)
+        bottom_sizer = wx.BoxSizer(wx.HORIZONTAL)
+
+        self.input_box = wx.TextCtrl(bottom_panel, style=wx.TE_PROCESS_ENTER)
+        self.input_box.Bind(wx.EVT_TEXT_ENTER, self.on_send)
+
+        self.send_button = wx.Button(bottom_panel, label="Send")
+        self.send_button.Bind(wx.EVT_BUTTON, self.on_send)
+
+        bottom_sizer.Add(self.input_box, 1, wx.EXPAND | wx.ALL, 5)
+        bottom_sizer.Add(self.send_button, 0, wx.ALL, 5)
+        bottom_panel.SetSizer(bottom_sizer)
+
+        main_sizer.Add(bottom_panel, 0, wx.EXPAND)
+
+        # =======================
+        # Status bar
+        # =======================
+        self.CreateStatusBar()
+        self.SetStatusText("Ready")
+
+        self.SetSizer(main_sizer)
+
+        # Create initial Status tab (select it at startup)
+        self._ensure_tab(self._status_tab_name, select=True)
+
+    # -----------------------------------------------------------------
+    # Tab helpers
+    # -----------------------------------------------------------------
+
+    def _ensure_tab(self, name: str, select: bool) -> None:
+        """
+        Ensure a tab with the given name exists.
+
+        - If it exists:
+            - Optionally select it.
+        - If it does not exist:
+            - Create it, and select depending on `select`.
+        """
+        for idx in range(self.notebook.GetPageCount()):
+            if self.notebook.GetPageText(idx) == name:
+                if select:
+                    self.notebook.SetSelection(idx)
+                return
+
+        # Create new tab
+        panel = wx.Panel(self.notebook)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        text_ctrl = wx.TextCtrl(
+            panel,
+            style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_RICH2,
+        )
+        sizer.Add(text_ctrl, 1, wx.EXPAND)
+
+        panel.SetSizer(sizer)
+        self.notebook.AddPage(panel, name, select=select)
+
+    def _create_tab(self, name: str) -> None:
+        """
+        User-driven tab creation: ensure tab exists and select it.
+        """
+        self._ensure_tab(name, select=True)
+
+    def _get_text_ctrl_for_tab(self, name: str) -> Optional[wx.TextCtrl]:
+        for idx in range(self.notebook.GetPageCount()):
+            if self.notebook.GetPageText(idx) == name:
+                page = self.notebook.GetPage(idx)
+                sizer = page.GetSizer()
+                if not sizer or sizer.GetItemCount() == 0:
+                    return None
+                item = sizer.GetItem(0)
+                ctrl = item.GetWindow()
+                if isinstance(ctrl, wx.TextCtrl):
+                    return ctrl
+        return None
+
+    def _append_to_tab(self, name: str, text: str) -> None:
+        """
+        Append a line of text to a tab, creating it if necessary,
+        but never stealing focus from the user.
+        """
+        # Ensure the tab exists but DO NOT select it
+        self._ensure_tab(name, select=False)
+        ctrl = self._get_text_ctrl_for_tab(name)
+        if ctrl is None:
             return
-
-        frame = ttk.Frame(self.notebook)
-        text_widget = self._create_text_widget(frame)
-
-        self.text_widgets[channel] = text_widget
-        self.notebook.add(frame, text=channel)
-
-    def _get_text_for_channel(self, channel: str) -> tk.Text:
-        if channel not in self.text_widgets:
-            self._create_channel_tab(channel)
-        return self.text_widgets[channel]
+        ctrl.SetInsertionPointEnd()
+        ctrl.WriteText(text)
 
     def _get_current_tab_name(self) -> str:
-        current = self.notebook.select()
-        tab_text = self.notebook.tab(current, "text")
-        return str(tab_text)
+        idx = self.notebook.GetSelection()
+        if idx == wx.NOT_FOUND:
+            return self._status_tab_name
+        return self.notebook.GetPageText(idx)
 
-    def _get_send_channel(self) -> str:
-        tab_name = self._get_current_tab_name()
-        if tab_name == self.STATUS_TAB_NAME:
-            return self.default_channel
-        return tab_name
-
-    # ------------------------------
+    # -----------------------------------------------------------------
     # Event handlers
-    # ------------------------------
+    # -----------------------------------------------------------------
 
-    def _on_send_clicked(self) -> None:
-        text = self.input_var.get().strip()
+    def on_node_activated(self, event: wx.ListEvent) -> None:
+        name = self.node_list.GetItemText(event.GetIndex())
+        self._create_tab(name)
+
+    def on_send(self, _event: wx.CommandEvent) -> None:
+        """
+        User pressed Enter or clicked Send.
+
+        - Append the message to the active chat tab.
+        - Send it to the backend.
+        """
+        text = self.input_box.GetValue().strip()
         if not text:
             return
 
-        channel = self._get_send_channel()
-        self.backend.send_message(channel, text)
-        self.input_var.set("")
+        tab_name = self._get_current_tab_name()
+        if tab_name == self._status_tab_name:
+            tab_name = "#general"
 
-    def _on_enter_pressed(self, _event: tk.Event) -> str:
-        self._on_send_clicked()
-        return "break"
+        # Local echo
+        ts_str = time.strftime("%H:%M:%S", time.localtime())
+        line = f"[{ts_str}] <me> {text}\n"
+        self._append_to_tab(tab_name, line)
 
-    # ------------------------------
-    # Queue polling
-    # ------------------------------
+        self.input_box.SetValue("")
+        self.backend.send_message(tab_name, text)
 
-    def _poll_ui_queue(self) -> None:
-        processed = False
+    def on_tab_close(self, event: aui.AuiNotebookEvent) -> None:
+        """
+        Prevent closing the Status tab.
+        """
+        idx = event.GetSelection()
+        name = self.notebook.GetPageText(idx)
+        if name == self._status_tab_name:
+            event.Veto()
+
+    # -----------------------------------------------------------------
+    # Backend queue polling
+    # -----------------------------------------------------------------
+
+    def on_timer(self, _event: wx.TimerEvent) -> None:
         try:
             while True:
-                event = self.ui_queue.get_nowait()
-                processed = True
-                if isinstance(event, ChatEvent):
-                    self._render_chat_event(event)
-                elif isinstance(event, StatusEvent):
-                    self._render_status_event(event)
+                ui_event = self.ui_queue.get_nowait()
+                if isinstance(ui_event, ChatEvent):
+                    self._render_chat_event(ui_event)
+                elif isinstance(ui_event, StatusEvent):
+                    self._render_status_event(ui_event)
         except queue.Empty:
-            if processed:
-                self._auto_scroll_active_tab()
-        self.after(self.POLL_INTERVAL_MS, self._poll_ui_queue)
+            pass
 
-    # ------------------------------
-    # Rendering
-    # ------------------------------
+    # -----------------------------------------------------------------
+    # Rendering helpers
+    # -----------------------------------------------------------------
 
-    def _render_chat_event(self, event: ChatEvent) -> None:
-        text_widget = self._get_text_for_channel(event.channel)
+    def _render_chat_event(self, ev: ChatEvent) -> None:
+        ts_str = time.strftime("%H:%M:%S", time.localtime(ev.timestamp))
+        line = f"[{ts_str}] <{ev.nick}> {ev.text}\n"
+        self._append_to_tab(ev.channel, line)
 
-        ts_struct = time.localtime(event.timestamp)
-        ts_str = time.strftime("%H:%M:%S", ts_struct)
-        line = f"[{ts_str}] <{event.nick}> {event.text}\n"
+    def _render_status_event(self, ev: StatusEvent) -> None:
+        self.SetStatusText(ev.text)
+        self._append_to_tab(self._status_tab_name, f"*** {ev.text}\n")
 
-        text_widget.configure(state="normal")
-        text_widget.insert("end", line)
-        text_widget.configure(state="disabled")
+    # -----------------------------------------------------------------
+    # Shutdown
+    # -----------------------------------------------------------------
 
-        current_tab = self._get_current_tab_name()
-        if current_tab == event.channel:
-            text_widget.see("end")
-
-    def _render_status_event(self, event: StatusEvent) -> None:
-        self.status_var.set(event.text)
-
-        text_widget = self.text_widgets[self.STATUS_TAB_NAME]
-        text_widget.configure(state="normal")
-        text_widget.insert("end", f"*** {event.text}\n")
-        text_widget.configure(state="disabled")
-
-        current_tab = self._get_current_tab_name()
-        if current_tab == self.STATUS_TAB_NAME:
-            text_widget.see("end")
-
-    def _auto_scroll_active_tab(self) -> None:
-        tab_name = self._get_current_tab_name()
-        widget = self.text_widgets.get(tab_name)
-        if widget is not None:
-            widget.see("end")
-
-
-class ChatApp(tk.Tk):
-    def __init__(self, backend: BackendInterface) -> None:
-        super().__init__()
-
-        self.backend = backend
-
-        self.title("Mesh Chat")
-        self.geometry("900x600")
-
-        style = ttk.Style(self)
-        if "clam" in style.theme_names():
-            style.theme_use("clam")
-
-        self.chat_ui = ChatUI(
-            self,
-            backend=self.backend,
-            initial_channels=["#general", "#random"],
-            default_channel="#general",
-        )
-        self.chat_ui.pack(fill="both", expand=True)
-
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
-
-        # Debug: dump threads to console a couple seconds after startup
-        self.after(2000, self._debug_dump_threads)
-
-    def _on_close(self) -> None:
+    def on_close(self, _event: wx.CloseEvent) -> None:
+        self._timer.Stop()
         self.backend.shutdown()
-        self.destroy()
-
-    @staticmethod
-    def _debug_dump_threads() -> None:
-        threads = threading.enumerate()
-        print("=== Active threads ===")
-        for t in threads:
-            print(f"- {t.name!r} (daemon={t.daemon})")
+        self.Destroy()
 
 
-# ============================================================
+# =====================================================================
+# wx.App bootstrap
+# =====================================================================
+
+class MeshChatApp(wx.App):
+    def __init__(self, backend: BackendInterface, **kwargs) -> None:
+        self._backend = backend
+        super().__init__(**kwargs)
+
+    def OnInit(self) -> bool:
+        frame = ChatFrame(self._backend)
+        frame.Show()
+        return True
+
+
+# =====================================================================
 # Entry point
-# ============================================================
+# =====================================================================
 
 if __name__ == "__main__":
-    # --- Option A: run with FakeBackend (no RF needed) ---
-    back_end: BackendInterface = FakeBackend(nick="Bob", default_channel="#general")
+    testing = False  # flip to False to use real MeshChatBackend
 
-    # --- Option B: run with real MeshChatBackend ---
-    # from chat_client import MeshChatConfig, ChatPeer
-    # from mesh_config import MeshNodeConfig
-    #
-    # mesh_cfg = MeshNodeConfig(
-    #     # fill in your existing MeshNodeConfig fields here
-    # )
-    #
-    # peers = {
-    #     "BASE": ChatPeer(
-    #         node_id=bytes.fromhex("0011223344556677"),
-    #         nick="BASE",
-    #     ),
-    # }
-    #
-    # chat_config = MeshChatConfig(
-    #     mesh_node_config=mesh_cfg,
-    #     db_path="mesh_chat.db",
-    #     peers=peers,
-    # )
-    #
-    # back_end = MeshChatBackend(
-    #     config=chat_config,
-    #     default_peer_nick="BASE",
-    #     status_heartbeat_interval=10.0,
-    # )
+    if testing:
+        back_end: BackendInterface = FakeBackend(
+            nick="Tester",
+            default_channel="#general",
+        )
+    else:
+        from pathlib import Path
+        from config_loader import load_chat_config_from_yaml
 
-    app = ChatApp(backend=back_end)
-    app.mainloop()
+        config_path = Path("config.yaml")
+        chat_config = load_chat_config_from_yaml(str(config_path))
+
+        if not chat_config.peers:
+            raise RuntimeError("No peers configured in chat.peers of config.yaml")
+
+        default_peer_nick = next(iter(chat_config.peers.keys()))
+
+        back_end = MeshChatBackend(
+            config=chat_config,
+            default_peer_nick=default_peer_nick,
+            status_heartbeat_interval=60.0,
+        )
+
+    app = MeshChatApp(back_end)
+    app.MainLoop()
