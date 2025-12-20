@@ -159,6 +159,27 @@ def load_chat_config_from_yaml(path: str) -> MeshChatConfig:
 
     db_path = str(_get_required(chat_cfg_raw, "db_path"))
 
+    # ---- sync config (optional) ----
+    sync_any = chat_cfg_raw.get("sync", {})
+    if not isinstance(sync_any, dict):
+        sync_raw: Dict[str, Any] = {}
+    else:
+        sync_raw = sync_any
+
+    sync_enabled = bool(sync_raw.get("enabled", True))
+    sync_last_n_messages = int(sync_raw.get("last_n_messages", 200))
+    sync_max_send_per_response = int(sync_raw.get("max_send_per_response", 200))
+    sync_auto_sync_on_new_peer = bool(sync_raw.get("auto_sync_on_new_peer", True))
+    sync_min_sync_interval_seconds = float(sync_raw.get("min_sync_interval_seconds", 30.0))
+
+    if sync_last_n_messages < 1:
+        raise ValueError("chat.sync.last_n_messages must be >= 1")
+    if sync_max_send_per_response < 1:
+        raise ValueError("chat.sync.max_send_per_response must be >= 1")
+    if sync_min_sync_interval_seconds < 0.0:
+        raise ValueError("chat.sync.min_sync_interval_seconds must be >= 0")
+    # -------------------------------
+
     peers_raw_any = chat_cfg_raw.get("peers", {})
     if not isinstance(peers_raw_any, dict):
         peers_raw = {}
@@ -189,4 +210,9 @@ def load_chat_config_from_yaml(path: str) -> MeshChatConfig:
         mesh_node_config=mesh_node_cfg,
         db_path=db_path,
         peers=peers,
+        sync_enabled=sync_enabled,
+        sync_last_n_messages=sync_last_n_messages,
+        sync_max_send_per_response=sync_max_send_per_response,
+        sync_auto_sync_on_new_peer=sync_auto_sync_on_new_peer,
+        sync_min_sync_interval_seconds=sync_min_sync_interval_seconds,
     )

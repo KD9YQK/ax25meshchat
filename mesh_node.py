@@ -181,7 +181,7 @@ class MeshNode:
         if self._cleanup_thread is not None:
             self._cleanup_thread.join(timeout=5.0)
 
-    def send_application_data(self, dest_node_id: bytes, payload: bytes) -> None:
+    def send_application_data(self, dest_node_id: bytes, payload: bytes) -> int:
         """
         Send application-level data to a destination node ID (8 bytes).
         """
@@ -192,6 +192,7 @@ class MeshNode:
         mesh_payload = self._build_data_payload(dest_node_id, seqno, payload)
         # For ARDOP: send raw mesh payload, no AX.25 wrapping
         self._link_client.send(mesh_payload)
+        return seqno
 
     # ------------------------------------------------------------------
     # ID / Seqno Helpers

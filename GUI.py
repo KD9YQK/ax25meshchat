@@ -19,12 +19,12 @@ Backend contract (same as Tkinter version):
 from __future__ import annotations
 
 import queue
-import threading
 import time
 from typing import Optional
 
 import wx
 import wx.aui as aui
+from config_gui import open_config_editor
 
 from mesh_backend import (
     BackendInterface,
@@ -32,50 +32,10 @@ from mesh_backend import (
     StatusEvent,
     UIEvent,
     MeshChatBackend,
+    NodeListEvent,
+    ChannelListEvent,
+    HistoryEvent,
 )
-
-
-# =====================================================================
-# Simple FakeBackend for local testing (no RF, no mesh)
-# =====================================================================
-
-class FakeBackend(BackendInterface):
-    """
-    Simple in-memory backend that:
-
-    - Accepts send_message() calls.
-    - Periodically emits StatusEvent heartbeats.
-    """
-
-    def __init__(self, nick: str = "Me", default_channel: str = "#general") -> None:
-        self._nick = nick
-        self._default_channel = default_channel
-        self._ui_queue: queue.Queue[UIEvent] = queue.Queue()
-        self._running = True
-
-        self._status_thread = threading.Thread(
-            target=self._status_loop,
-            name="FakeBackendStatus",
-            daemon=True,
-        )
-        self._status_thread.start()
-
-    def get_ui_queue(self) -> queue.Queue[UIEvent]:
-        return self._ui_queue
-
-    def send_message(self, channel: str, text: str) -> None:
-        # For fake backend, just log to status so you see activity.
-        self._ui_queue.put(StatusEvent(text=f"Fake send to {channel}: {text!r}"))
-
-    def shutdown(self) -> None:
-        self._running = False
-
-    def _status_loop(self) -> None:
-        while self._running:
-            time.sleep(10.0)
-            if not self._running:
-                return
-            self._ui_queue.put(StatusEvent(text="Fake backend heartbeat..."))
 
 
 # =====================================================================
@@ -93,13 +53,24 @@ class ChatFrame(wx.Frame):
 
     POLL_INTERVAL_MS = 100
 
-    def __init__(self, backend: BackendInterface) -> None:
+    def __init__(self, backend: BackendInterface, cfg_path: str = "config.yaml") -> None:
         super().__init__(None, title="ARDOP Mesh Chat", size=wx.Size(1000, 700))
         self.backend = backend
+        self.config_path = cfg_path
         self.ui_queue: queue.Queue[UIEvent] = backend.get_ui_queue()
         self._status_tab_name = "Status"
+        self._known_nodes: list[str] = []
+        self._known_channels: list[str] = []
+        self._history_loaded: set[str] = set()
 
         self._build_ui()
+
+        # Preload history for #general (tab is created on demand; this won't steal focus)
+        try:
+            self.backend.request_history("#general", limit=200)
+            self._history_loaded.add("#general")
+        except AttributeError:
+            pass
 
         # Timer for backend queue polling
         self._timer = wx.Timer(self)
@@ -116,6 +87,16 @@ class ChatFrame(wx.Frame):
         main_sizer = wx.BoxSizer(wx.VERTICAL)
 
         # =======================
+        # Menu bar (dropdown)
+        # =======================
+        menubar = wx.MenuBar()
+        settings_menu = wx.Menu()
+        mi_edit = settings_menu.Append(wx.ID_ANY, "Edit Config…\tCtrl+,", "Open config editor")
+        self.Bind(wx.EVT_MENU, self.on_edit_config, mi_edit)
+        menubar.Append(settings_menu, "Settings")
+        self.SetMenuBar(menubar)
+
+        # =======================
         # Top: Splitter
         # =======================
         splitter = wx.SplitterWindow(self, style=wx.SP_LIVE_UPDATE)
@@ -130,11 +111,8 @@ class ChatFrame(wx.Frame):
             style=wx.LC_REPORT | wx.LC_SINGLE_SEL,
         )
         self.node_list.InsertColumn(0, "Name", width=200)
-
-        # Demo entries; real app will populate from mesh/chat state
+        # Static channel(s). Dynamic nodes are populated from mesh state.
         self.node_list.InsertItem(0, "#general")
-        self.node_list.InsertItem(1, "#random")
-        self.node_list.InsertItem(2, "@K0TEST-7")
 
         self.node_list.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.on_node_activated)
 
@@ -149,9 +127,9 @@ class ChatFrame(wx.Frame):
         self.notebook = aui.AuiNotebook(
             right_panel,
             style=(
-                aui.AUI_NB_DEFAULT_STYLE
-                | aui.AUI_NB_TAB_MOVE
-                | aui.AUI_NB_CLOSE_ON_ACTIVE_TAB
+                    aui.AUI_NB_DEFAULT_STYLE
+                    | aui.AUI_NB_TAB_MOVE
+                    | aui.AUI_NB_CLOSE_ON_ACTIVE_TAB
             ),
         )
         self.notebook.Bind(aui.EVT_AUINOTEBOOK_PAGE_CLOSE, self.on_tab_close)
@@ -186,7 +164,10 @@ class ChatFrame(wx.Frame):
         # Status bar
         # =======================
         self.CreateStatusBar()
-        self.SetStatusText("Ready")
+        self.GetStatusBar().SetFieldsCount(3)
+        self.SetStatusText("Ready", 0)
+        self.SetStatusText("Nodes: 0", 1)
+        self.SetStatusText("", 2)
 
         self.SetSizer(main_sizer)
 
@@ -270,6 +251,13 @@ class ChatFrame(wx.Frame):
     def on_node_activated(self, event: wx.ListEvent) -> None:
         name = self.node_list.GetItemText(event.GetIndex())
         self._create_tab(name)
+        self.SetStatusText(f"Active: {name}", 2)
+        if name != self._status_tab_name and name not in self._history_loaded:
+            try:
+                self.backend.request_history(name, limit=200)
+                self._history_loaded.add(name)
+            except AttributeError:
+                pass
 
     def on_send(self, _event: wx.CommandEvent) -> None:
         """
@@ -315,8 +303,24 @@ class ChatFrame(wx.Frame):
                     self._render_chat_event(ui_event)
                 elif isinstance(ui_event, StatusEvent):
                     self._render_status_event(ui_event)
+                elif isinstance(ui_event, NodeListEvent):
+                    self._render_node_list_event(ui_event)
+                elif isinstance(ui_event, ChannelListEvent):
+                    self._render_channel_list_event(ui_event)
+                elif isinstance(ui_event, HistoryEvent):
+                    self._render_history_event(ui_event)
         except queue.Empty:
             pass
+
+    def on_edit_config(self, _event: wx.CommandEvent) -> None:
+        """Open the YAML config editor dialog."""
+        saved = open_config_editor(self, self.config_path)
+        if saved:
+            wx.MessageBox(
+                "Saved config.yaml. Restart the app to apply changes to a running backend.",
+                "Config Saved",
+                wx.ICON_INFORMATION,
+            )
 
     # -----------------------------------------------------------------
     # Rendering helpers
@@ -328,12 +332,73 @@ class ChatFrame(wx.Frame):
         self._append_to_tab(ev.channel, line)
 
     def _render_status_event(self, ev: StatusEvent) -> None:
-        self.SetStatusText(ev.text)
+        self.SetStatusText(ev.text, 0)
         self._append_to_tab(self._status_tab_name, f"*** {ev.text}\n")
 
     # -----------------------------------------------------------------
     # Shutdown
     # -----------------------------------------------------------------
+
+    def _render_node_list_event(self, ev: NodeListEvent) -> None:
+        self._known_nodes = ev.nodes
+        self._rebuild_left_list()
+
+        # Status strip
+        self.SetStatusText(f"Nodes: {len(ev.nodes)}", 1)
+
+    def _render_channel_list_event(self, ev: ChannelListEvent) -> None:
+        self._known_channels = ev.channels
+        self._rebuild_left_list()
+
+    def _render_history_event(self, ev: HistoryEvent) -> None:
+        # Render persisted history for a channel/DM.
+        # Do not steal focus.
+        self._ensure_tab(ev.channel, select=False)
+
+        first_load = ev.channel not in self._history_loaded
+        if first_load:
+            self._history_loaded.add(ev.channel)
+        if first_load:
+            ctrl = self._get_text_ctrl_for_tab(ev.channel)
+            if ctrl is not None:
+                ctrl.SetValue("")
+        for (origin_id, seqno, channel, nick, text, ts) in ev.messages:
+            ts_str = time.strftime("%H:%M:%S", time.localtime(ts))
+            line = f"[{ts_str}] <{nick}> {text}\n"
+            self._append_to_tab(channel, line)
+
+    def _rebuild_left_list(self) -> None:
+        # Preserve selection if possible
+        selected = None
+        sel_idx = self.node_list.GetFirstSelected()
+        if sel_idx != -1:
+            selected = self.node_list.GetItemText(sel_idx)
+
+        self.node_list.DeleteAllItems()
+        self.node_list.InsertItem(0, "#general")
+        row = 1
+
+        # Local channels/DMs from history (excluding #general)
+        for chan in self._known_channels:
+            if chan == "#general":
+                continue
+            self.node_list.InsertItem(row, chan)
+            row += 1
+
+        # Discovered nodes as DMs (displayed as @CALLSIGN)
+        for callsign in self._known_nodes:
+            name = f"@{callsign}"
+            # Avoid duplicates if already present
+            if name in self._known_channels:
+                continue
+            self.node_list.InsertItem(row, name)
+            row += 1
+
+        if selected is not None:
+            for i in range(self.node_list.GetItemCount()):
+                if self.node_list.GetItemText(i) == selected:
+                    self.node_list.Select(i)
+                    break
 
     def on_close(self, _event: wx.CloseEvent) -> None:
         self._timer.Stop()
@@ -346,12 +411,13 @@ class ChatFrame(wx.Frame):
 # =====================================================================
 
 class MeshChatApp(wx.App):
-    def __init__(self, backend: BackendInterface, **kwargs) -> None:
+    def __init__(self, backend: BackendInterface, cfg_path: str = "config.yaml", **kwargs) -> None:
         self._backend = backend
+        self._config_path = cfg_path
         super().__init__(**kwargs)
 
     def OnInit(self) -> bool:
-        frame = ChatFrame(self._backend)
+        frame = ChatFrame(self._backend, cfg_path=self._config_path)
         frame.Show()
         return True
 
@@ -361,30 +427,22 @@ class MeshChatApp(wx.App):
 # =====================================================================
 
 if __name__ == "__main__":
-    testing = False  # flip to False to use real MeshChatBackend
+    from pathlib import Path
+    from config_loader import load_chat_config_from_yaml
 
-    if testing:
-        back_end: BackendInterface = FakeBackend(
-            nick="Tester",
-            default_channel="#general",
-        )
-    else:
-        from pathlib import Path
-        from config_loader import load_chat_config_from_yaml
+    config_path = Path("config.yaml")
+    chat_config = load_chat_config_from_yaml(str(config_path))
 
-        config_path = Path("config.yaml")
-        chat_config = load_chat_config_from_yaml(str(config_path))
+    if not chat_config.peers:
+        raise RuntimeError("No peers configured in chat.peers of config.yaml")
 
-        if not chat_config.peers:
-            raise RuntimeError("No peers configured in chat.peers of config.yaml")
+    default_peer_nick = next(iter(chat_config.peers.keys()))
 
-        default_peer_nick = next(iter(chat_config.peers.keys()))
+    back_end = MeshChatBackend(
+        config=chat_config,
+        default_peer_nick=default_peer_nick,
+        status_heartbeat_interval=60.0,
+    )
 
-        back_end = MeshChatBackend(
-            config=chat_config,
-            default_peer_nick=default_peer_nick,
-            status_heartbeat_interval=60.0,
-        )
-
-    app = MeshChatApp(back_end)
+    app = MeshChatApp(back_end, cfg_path=str(config_path))
     app.MainLoop()

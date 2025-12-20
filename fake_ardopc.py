@@ -236,7 +236,7 @@ class FakeArdopServer:
                 if len(st.rx_buf) < 2 + frame_len:
                     break
 
-                payload = bytes(st.rx_buf[2 : 2 + frame_len])
+                payload = bytes(st.rx_buf[2: 2 + frame_len])
                 del st.rx_buf[: 2 + frame_len]
 
                 print(f"[fake_ardopc] RX from {st.addr}: {len(payload)} bytes: {_hex(payload)}")

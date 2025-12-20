@@ -1,5 +1,3 @@
-# chat_store.py
-
 from __future__ import annotations
 
 import sqlite3
@@ -73,24 +71,35 @@ class ChatStore:
         row = cur.fetchone()
         return row is not None
 
+    def get_last_n_messages(
+        self,
+        channel: str,
+        limit: int = 100,
+    ) -> List[Tuple[bytes, int, str, str, str, float]]:
+        """
+        Return the most recent `limit` messages in `channel`, ordered oldest->newest.
+        """
+        sql = """
+        SELECT origin_id, seqno, channel, nick, text, ts
+        FROM chat_messages
+        WHERE channel = ?
+        ORDER BY ts DESC
+        LIMIT ?;
+        """
+        cur = self._conn.execute(sql, (channel, limit))
+        rows = cur.fetchall()
+        rows.reverse()  # oldest -> newest for UI rendering
+        return rows
+
     def get_recent_messages(
         self,
         channel: str,
         limit: int = 100,
     ) -> List[Tuple[bytes, int, str, str, str, float]]:
         """
-        Return latest messages in a channel, newest last.
+        Backwards-compatible name used by the GUI/backend: returns newest `limit`, oldest->newest.
         """
-        sql = """
-        SELECT origin_id, seqno, channel, nick, text, ts
-        FROM chat_messages
-        WHERE channel = ?
-        ORDER BY ts ASC
-        LIMIT ?;
-        """
-        cur = self._conn.execute(sql, (channel, limit))
-        rows = cur.fetchall()
-        return rows
+        return self.get_last_n_messages(channel, limit)
 
     def get_messages_since(
         self,
@@ -112,5 +121,23 @@ class ChatStore:
         rows = cur.fetchall()
         return rows
 
+    def list_channels(self, limit: int = 50) -> List[str]:
+        """
+        Return distinct channel identifiers ordered by most recent activity.
+        This includes normal channels (e.g. '#general') and DM channel keys
+        (whatever naming convention the client uses).
+        """
+        sql = """
+        SELECT channel, MAX(ts) AS last_ts
+        FROM chat_messages
+        GROUP BY channel
+        ORDER BY last_ts DESC
+        LIMIT ?;
+        """
+        cur = self._conn.execute(sql, (limit,))
+        rows = cur.fetchall()
+        return [str(r[0]) for r in rows]
+
     def close(self) -> None:
         self._conn.close()
+

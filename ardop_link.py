@@ -281,7 +281,6 @@ class ArdopLinkClient:
                 continue
 
             if (not self._connected.is_set()) or (self._sock is None):
-                #self._connect_with_backoff()
                 if (not self._connected.is_set()) or (self._sock is None):
                     LOG.warning("Dropping TX frame: no ARDOP TCP connection available")
                     continue
@@ -327,6 +326,7 @@ class ArdopLinkClient:
     # RX framing
     # ------------------------------------------------------------------
 
+    # noinspection PyBroadException
     def _process_rx_bytes(self, data: bytes) -> None:
         """Append incoming bytes to buffer and extract complete frames."""
         self._rx_buffer.extend(data)
@@ -353,8 +353,26 @@ class ArdopLinkClient:
             # Deliver to user callback
             try:
                 self._rx_callback(frame)
-            except Exception:
+            except (ValueError, RuntimeError, ArdopLinkError):
+                # Expected "bad frame" / "cannot decode" style failures from consumers.
+                # We drop the frame and continue.
                 LOG.warning(
                     "Error in ARDOP RX callback; frame dropped",
                     exc_info=True,
                 )
+            except Exception:
+                # Any other exception is treated as a programming error in the consumer.
+                # Stop the link client rather than silently swallowing it in a tight loop.
+                LOG.exception(
+                    "Unhandled exception in ARDOP RX callback; stopping link client",
+                )
+                self._running.clear()
+                self._connected.clear()
+                with self._lock:
+                    if self._sock is not None:
+                        try:
+                            self._sock.close()
+                        except OSError:
+                            pass
+                        self._sock = None
+                return

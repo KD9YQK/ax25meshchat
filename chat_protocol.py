@@ -1,5 +1,3 @@
-# chat_protocol.py
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -82,13 +80,44 @@ def decode_chat_message(data: bytes) -> Optional[ChatMessage]:
 
 # --------------------- SYNC helpers ---------------------
 
+@dataclass(frozen=True)
+class SyncRequest:
+    # mode="since_ts" uses {"since_ts": float}
+    # mode="seqno" uses {"mode":"seqno","last_n":int,"inv":{origin_hex:int}}
+    mode: str
+    since_ts: Optional[float]
+    last_n: int
+    inv: Dict[str, int]
+
 
 def encode_sync_request(channel: str, nick: str, since_ts: float) -> bytes:
     """
-    SYNC_REQUEST: text = JSON {"since_ts": float}
+    Backwards-compatible SYNC_REQUEST v1: text = JSON {"since_ts": float}
     """
-    payload = {
-        "since_ts": since_ts,
+    payload = {"since_ts": since_ts}
+    msg = ChatMessage(
+        msg_type=CHAT_TYPE_SYNC_REQUEST,
+        channel=channel,
+        nick=nick,
+        text=json.dumps(payload),
+    )
+    return encode_chat_message(msg)
+
+
+def encode_sync_request_seqno(
+    channel: str,
+    nick: str,
+    last_n: int,
+    inv: Dict[str, int],
+) -> bytes:
+    """
+    SYNC_REQUEST v2 (seqno inventory):
+      text = JSON {"mode":"seqno","last_n":int,"inv":{origin_id_hex:int}}
+    """
+    payload: Dict[str, Any] = {
+        "mode": "seqno",
+        "last_n": int(last_n),
+        "inv": inv,
     }
     msg = ChatMessage(
         msg_type=CHAT_TYPE_SYNC_REQUEST,
@@ -99,26 +128,52 @@ def encode_sync_request(channel: str, nick: str, since_ts: float) -> bytes:
     return encode_chat_message(msg)
 
 
-def parse_sync_request(msg: ChatMessage) -> Optional[float]:
+def parse_sync_request_any(msg: ChatMessage) -> Optional[SyncRequest]:
     """
-    Returns since_ts or None on error.
+    Parse either v1 {"since_ts": ...} or v2 {"mode":"seqno",...}.
+
+    Returns SyncRequest or None on error.
     """
     try:
         obj = json.loads(msg.text)
     except json.JSONDecodeError:
         return None
+    if not isinstance(obj, dict):
+        return None
+
+    # v2 inventory mode
+    mode = obj.get("mode")
+    if mode == "seqno":
+        last_n = obj.get("last_n")
+        inv = obj.get("inv")
+        if not isinstance(last_n, int):
+            return None
+        if not isinstance(inv, dict):
+            return None
+
+        inv_clean: Dict[str, int] = {}
+        for k, v in inv.items():
+            if not isinstance(k, str):
+                continue
+            if not isinstance(v, int):
+                continue
+            inv_clean[k] = v
+
+        return SyncRequest(mode="seqno", since_ts=None, last_n=int(last_n), inv=inv_clean)
+
+    # v1 since_ts
     if "since_ts" not in obj:
         return None
     value = obj["since_ts"]
     if not isinstance(value, (float, int)):
         return None
-    return float(value)
+    return SyncRequest(mode="since_ts", since_ts=float(value), last_n=0, inv={})
 
 
 def encode_sync_response(
-        channel: str,
-        nick: str,
-        records: List[Dict[str, Any]],
+    channel: str,
+    nick: str,
+    records: List[Dict[str, Any]],
 ) -> bytes:
     """
     SYNC_RESPONSE: text = JSON list of records:

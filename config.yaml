@@ -13,9 +13,9 @@ routing:
   # One OGM every 10 minutes
   ogm_interval_seconds: 600.0
   ogm_ttl: 5
-  route_expiry_seconds: 120.0
-  neighbor_expiry_seconds: 60.0
-  data_seen_expiry_seconds: 30.0
+  route_expiry_seconds: 1200.0
+  neighbor_expiry_seconds: 610.0
+  data_seen_expiry_seconds: 610.0
 
 security:
   # MUST remain false for anything on ham bands
@@ -24,6 +24,12 @@ security:
 
 chat:
   db_path: "chat_logs.sqlite"
+  sync:
+    enabled: true
+    last_n_messages: 200          # window size per channel/DM
+    max_send_per_response: 200    # cap to avoid huge bursts
+    auto_sync_on_new_peer: true   # when a new node appears
+    min_sync_interval_seconds: 30 # per-peer/per-channel cooldown
   peers:
     bob:
       node_id_hex: "0011223344556677"
