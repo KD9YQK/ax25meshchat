@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Mesh Chat GUI (wxPython version, no AUI manager)
+Mesh Chat GUI (wxPython version)
 
 Layout:
 - Top: SplitterWindow
@@ -9,10 +9,13 @@ Layout:
 - Bottom: Input row (separate textbox + Send button) spanning full width
 - Status bar at the bottom
 
-Backend contract (same as Tkinter version):
+Backend contract:
 - backend: BackendInterface
     - get_ui_queue() -> queue.Queue[UIEvent]
     - send_message(channel: str, text: str) -> None
+    - request_history(channel: str, limit: int = 200) -> None
+    - request_sync_for_channel(channel: str) -> None
+    - prune_db() -> None
     - shutdown() -> None
 """
 
@@ -24,7 +27,6 @@ from typing import Optional
 
 import wx
 import wx.aui as aui
-from config_gui import open_config_editor
 
 from mesh_backend import (
     BackendInterface,
@@ -38,26 +40,15 @@ from mesh_backend import (
 )
 
 
-# =====================================================================
-# Main Application Frame
-# =====================================================================
-
 class ChatFrame(wx.Frame):
-    """
-    Main wxPython frame:
-
-    - splitter: left node list, right notebook
-    - notebook: tabs per channel/DM
-    - bottom input row
-    """
-
     POLL_INTERVAL_MS = 100
 
-    def __init__(self, backend: BackendInterface, cfg_path: str = "config.yaml") -> None:
+    def __init__(self, backend: BackendInterface, config_path: str = "config.yaml") -> None:
         super().__init__(None, title="ARDOP Mesh Chat", size=wx.Size(1000, 700))
         self.backend = backend
-        self.config_path = cfg_path
         self.ui_queue: queue.Queue[UIEvent] = backend.get_ui_queue()
+        self._config_path: str = str(config_path)
+
         self._status_tab_name = "Status"
         self._known_nodes: list[str] = []
         self._known_channels: list[str] = []
@@ -65,7 +56,7 @@ class ChatFrame(wx.Frame):
 
         self._build_ui()
 
-        # Preload history for #general (tab is created on demand; this won't steal focus)
+        # Preload local history for #general (does not steal focus)
         try:
             self.backend.request_history("#general", limit=200)
             self._history_loaded.add("#general")
@@ -87,12 +78,19 @@ class ChatFrame(wx.Frame):
         main_sizer = wx.BoxSizer(wx.VERTICAL)
 
         # =======================
-        # Menu bar (dropdown)
+        # Menu bar
         # =======================
         menubar = wx.MenuBar()
         settings_menu = wx.Menu()
-        mi_edit = settings_menu.Append(wx.ID_ANY, "Edit Config…\tCtrl+,", "Open config editor")
-        self.Bind(wx.EVT_MENU, self.on_edit_config, mi_edit)
+
+        mi_config = settings_menu.Append(wx.ID_ANY, "Config…", "Edit config.yaml (requires restart to apply)")
+        self.Bind(wx.EVT_MENU, self.on_open_config, mi_config)
+
+        settings_menu.AppendSeparator()
+
+        mi_prune = settings_menu.Append(wx.ID_ANY, "Prune Chat DB…", "Delete old chat history from the local database")
+        self.Bind(wx.EVT_MENU, self.on_prune_db, mi_prune)
+
         menubar.Append(settings_menu, "Settings")
         self.SetMenuBar(menubar)
 
@@ -106,12 +104,10 @@ class ChatFrame(wx.Frame):
         left_sizer = wx.BoxSizer(wx.VERTICAL)
 
         label = wx.StaticText(left_panel, label="Nodes / Channels")
-        self.node_list = wx.ListCtrl(
-            left_panel,
-            style=wx.LC_REPORT | wx.LC_SINGLE_SEL,
-        )
+        self.node_list = wx.ListCtrl(left_panel, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
         self.node_list.InsertColumn(0, "Name", width=200)
-        # Static channel(s). Dynamic nodes are populated from mesh state.
+
+        # Built-in channel(s). Dynamic channels/nodes are populated from mesh state + DB.
         self.node_list.InsertItem(0, "#general")
 
         self.node_list.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.on_node_activated)
@@ -126,11 +122,7 @@ class ChatFrame(wx.Frame):
 
         self.notebook = aui.AuiNotebook(
             right_panel,
-            style=(
-                    aui.AUI_NB_DEFAULT_STYLE
-                    | aui.AUI_NB_TAB_MOVE
-                    | aui.AUI_NB_CLOSE_ON_ACTIVE_TAB
-            ),
+            style=(aui.AUI_NB_DEFAULT_STYLE | aui.AUI_NB_TAB_MOVE | aui.AUI_NB_CLOSE_ON_ACTIVE_TAB),
         )
         self.notebook.Bind(aui.EVT_AUINOTEBOOK_PAGE_CLOSE, self.on_tab_close)
 
@@ -179,37 +171,22 @@ class ChatFrame(wx.Frame):
     # -----------------------------------------------------------------
 
     def _ensure_tab(self, name: str, select: bool) -> None:
-        """
-        Ensure a tab with the given name exists.
-
-        - If it exists:
-            - Optionally select it.
-        - If it does not exist:
-            - Create it, and select depending on `select`.
-        """
         for idx in range(self.notebook.GetPageCount()):
             if self.notebook.GetPageText(idx) == name:
                 if select:
                     self.notebook.SetSelection(idx)
                 return
 
-        # Create new tab
         panel = wx.Panel(self.notebook)
         sizer = wx.BoxSizer(wx.VERTICAL)
 
-        text_ctrl = wx.TextCtrl(
-            panel,
-            style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_RICH2,
-        )
+        text_ctrl = wx.TextCtrl(panel, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_RICH2)
         sizer.Add(text_ctrl, 1, wx.EXPAND)
 
         panel.SetSizer(sizer)
         self.notebook.AddPage(panel, name, select=select)
 
     def _create_tab(self, name: str) -> None:
-        """
-        User-driven tab creation: ensure tab exists and select it.
-        """
         self._ensure_tab(name, select=True)
 
     def _get_text_ctrl_for_tab(self, name: str) -> Optional[wx.TextCtrl]:
@@ -226,11 +203,6 @@ class ChatFrame(wx.Frame):
         return None
 
     def _append_to_tab(self, name: str, text: str) -> None:
-        """
-        Append a line of text to a tab, creating it if necessary,
-        but never stealing focus from the user.
-        """
-        # Ensure the tab exists but DO NOT select it
         self._ensure_tab(name, select=False)
         ctrl = self._get_text_ctrl_for_tab(name)
         if ctrl is None:
@@ -252,6 +224,8 @@ class ChatFrame(wx.Frame):
         name = self.node_list.GetItemText(event.GetIndex())
         self._create_tab(name)
         self.SetStatusText(f"Active: {name}", 2)
+
+        # Load local history once per tab
         if name != self._status_tab_name and name not in self._history_loaded:
             try:
                 self.backend.request_history(name, limit=200)
@@ -259,13 +233,13 @@ class ChatFrame(wx.Frame):
             except AttributeError:
                 pass
 
-    def on_send(self, _event: wx.CommandEvent) -> None:
-        """
-        User pressed Enter or clicked Send.
+        # Also request a network sync (backend throttles)
+        try:
+            self.backend.request_sync_for_channel(name)
+        except AttributeError:
+            pass
 
-        - Append the message to the active chat tab.
-        - Send it to the backend.
-        """
+    def on_send(self, _event: wx.CommandEvent) -> None:
         text = self.input_box.GetValue().strip()
         if not text:
             return
@@ -274,22 +248,81 @@ class ChatFrame(wx.Frame):
         if tab_name == self._status_tab_name:
             tab_name = "#general"
 
-        # Local echo
         ts_str = time.strftime("%H:%M:%S", time.localtime())
-        line = f"[{ts_str}] <me> {text}\n"
-        self._append_to_tab(tab_name, line)
+        self._append_to_tab(tab_name, f"[{ts_str}] <me> {text}\n")
 
         self.input_box.SetValue("")
         self.backend.send_message(tab_name, text)
 
     def on_tab_close(self, event: aui.AuiNotebookEvent) -> None:
-        """
-        Prevent closing the Status tab.
-        """
         idx = event.GetSelection()
         name = self.notebook.GetPageText(idx)
         if name == self._status_tab_name:
             event.Veto()
+            return
+        # Allow tab close, but forget cached history so reopening reloads from DB.
+        self._history_loaded.discard(name)
+
+    def on_open_config(self, _event: wx.CommandEvent) -> None:
+        # Lazy import so the main GUI can run even if the config editor module is missing.
+        try:
+            from config_gui import open_config_editor  # type: ignore
+        except ImportError:
+            wx.MessageBox(
+                "Config editor module 'config_gui.py' not found.",
+                "Config",
+                wx.ICON_WARNING,
+            )
+            return
+
+        saved = open_config_editor(self, config_path=str(self._config_path))
+        if saved:
+            wx.MessageBox(
+                "Saved config.yaml. Restart the app to apply changes.",
+                "Config",
+                wx.ICON_INFORMATION,
+            )
+
+    def on_prune_db(self, _event: wx.CommandEvent) -> None:
+        dlg = wx.MessageDialog(
+            self,
+            "This will delete old chat history from your local SQLite database.\n\n"
+            "This cannot be undone.\n\n"
+            "Proceed?",
+            "Prune Chat DB",
+            style=wx.OK | wx.CANCEL | wx.ICON_WARNING,
+        )
+        try:
+            result = dlg.ShowModal()
+        finally:
+            dlg.Destroy()
+
+        if result != wx.ID_OK:
+            return
+
+        try:
+            self.backend.prune_db()
+        except AttributeError:
+            wx.MessageBox("Backend does not support pruning.", "Not Supported", wx.ICON_ERROR)
+            return
+
+        # Reload history for all open chat tabs to reflect pruning.
+        # (Status tab is excluded; it is not backed by DB history.)
+        open_tabs: list[str] = []
+        for idx in range(self.notebook.GetPageCount()):
+            name = self.notebook.GetPageText(idx)
+            if name != self._status_tab_name:
+                open_tabs.append(name)
+
+        for name in open_tabs:
+            self._history_loaded.discard(name)
+
+        for name in open_tabs:
+            try:
+                self.backend.request_history(name, limit=200)
+            except AttributeError:
+                break
+
 
     # -----------------------------------------------------------------
     # Backend queue polling
@@ -312,38 +345,21 @@ class ChatFrame(wx.Frame):
         except queue.Empty:
             pass
 
-    def on_edit_config(self, _event: wx.CommandEvent) -> None:
-        """Open the YAML config editor dialog."""
-        saved = open_config_editor(self, self.config_path)
-        if saved:
-            wx.MessageBox(
-                "Saved config.yaml. Restart the app to apply changes to a running backend.",
-                "Config Saved",
-                wx.ICON_INFORMATION,
-            )
-
     # -----------------------------------------------------------------
     # Rendering helpers
     # -----------------------------------------------------------------
 
     def _render_chat_event(self, ev: ChatEvent) -> None:
         ts_str = time.strftime("%H:%M:%S", time.localtime(ev.timestamp))
-        line = f"[{ts_str}] <{ev.nick}> {ev.text}\n"
-        self._append_to_tab(ev.channel, line)
+        self._append_to_tab(ev.channel, f"[{ts_str}] <{ev.nick}> {ev.text}\n")
 
     def _render_status_event(self, ev: StatusEvent) -> None:
         self.SetStatusText(ev.text, 0)
         self._append_to_tab(self._status_tab_name, f"*** {ev.text}\n")
 
-    # -----------------------------------------------------------------
-    # Shutdown
-    # -----------------------------------------------------------------
-
     def _render_node_list_event(self, ev: NodeListEvent) -> None:
         self._known_nodes = ev.nodes
         self._rebuild_left_list()
-
-        # Status strip
         self.SetStatusText(f"Nodes: {len(ev.nodes)}", 1)
 
     def _render_channel_list_event(self, ev: ChannelListEvent) -> None:
@@ -351,24 +367,20 @@ class ChatFrame(wx.Frame):
         self._rebuild_left_list()
 
     def _render_history_event(self, ev: HistoryEvent) -> None:
-        # Render persisted history for a channel/DM.
-        # Do not steal focus.
         self._ensure_tab(ev.channel, select=False)
 
         first_load = ev.channel not in self._history_loaded
         if first_load:
             self._history_loaded.add(ev.channel)
-        if first_load:
             ctrl = self._get_text_ctrl_for_tab(ev.channel)
             if ctrl is not None:
                 ctrl.SetValue("")
+
         for (origin_id, seqno, channel, nick, text, ts) in ev.messages:
             ts_str = time.strftime("%H:%M:%S", time.localtime(ts))
-            line = f"[{ts_str}] <{nick}> {text}\n"
-            self._append_to_tab(channel, line)
+            self._append_to_tab(channel, f"[{ts_str}] <{nick}> {text}\n")
 
     def _rebuild_left_list(self) -> None:
-        # Preserve selection if possible
         selected = None
         sel_idx = self.node_list.GetFirstSelected()
         if sel_idx != -1:
@@ -378,17 +390,14 @@ class ChatFrame(wx.Frame):
         self.node_list.InsertItem(0, "#general")
         row = 1
 
-        # Local channels/DMs from history (excluding #general)
         for chan in self._known_channels:
             if chan == "#general":
                 continue
             self.node_list.InsertItem(row, chan)
             row += 1
 
-        # Discovered nodes as DMs (displayed as @CALLSIGN)
         for callsign in self._known_nodes:
             name = f"@{callsign}"
-            # Avoid duplicates if already present
             if name in self._known_channels:
                 continue
             self.node_list.InsertItem(row, name)
@@ -400,38 +409,34 @@ class ChatFrame(wx.Frame):
                     self.node_list.Select(i)
                     break
 
+    # -----------------------------------------------------------------
+    # Shutdown
+    # -----------------------------------------------------------------
+
     def on_close(self, _event: wx.CloseEvent) -> None:
         self._timer.Stop()
         self.backend.shutdown()
         self.Destroy()
 
 
-# =====================================================================
-# wx.App bootstrap
-# =====================================================================
-
 class MeshChatApp(wx.App):
-    def __init__(self, backend: BackendInterface, cfg_path: str = "config.yaml", **kwargs) -> None:
+    def __init__(self, backend: BackendInterface, config_path: str = "config.yaml", **kwargs) -> None:
         self._backend = backend
-        self._config_path = cfg_path
+        self._config_path: str = str(config_path)
         super().__init__(**kwargs)
 
     def OnInit(self) -> bool:
-        frame = ChatFrame(self._backend, cfg_path=self._config_path)
+        frame = ChatFrame(self._backend, config_path=self._config_path)
         frame.Show()
         return True
 
-
-# =====================================================================
-# Entry point
-# =====================================================================
 
 if __name__ == "__main__":
     from pathlib import Path
     from config_loader import load_chat_config_from_yaml
 
-    config_path = Path("config.yaml")
-    chat_config = load_chat_config_from_yaml(str(config_path))
+    _config_path = Path("config.yaml")
+    chat_config = load_chat_config_from_yaml(str(_config_path))
 
     if not chat_config.peers:
         raise RuntimeError("No peers configured in chat.peers of config.yaml")
@@ -444,5 +449,5 @@ if __name__ == "__main__":
         status_heartbeat_interval=60.0,
     )
 
-    app = MeshChatApp(back_end, cfg_path=str(config_path))
+    app = MeshChatApp(back_end, config_path=str(_config_path))
     app.MainLoop()

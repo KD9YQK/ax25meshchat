@@ -1,3 +1,5 @@
+# chat_store.py
+
 from __future__ import annotations
 
 import sqlite3
@@ -36,13 +38,13 @@ class ChatStore:
         self._conn.commit()
 
     def add_message(
-        self,
-        origin_id: bytes,
-        seqno: int,
-        channel: str,
-        nick: str,
-        text: str,
-        ts: Optional[float] = None,
+            self,
+            origin_id: bytes,
+            seqno: int,
+            channel: str,
+            nick: str,
+            text: str,
+            ts: Optional[float] = None,
     ) -> None:
         """
         Insert a message, ignoring if already present.
@@ -71,41 +73,43 @@ class ChatStore:
         row = cur.fetchone()
         return row is not None
 
-    def get_last_n_messages(
-        self,
-        channel: str,
-        limit: int = 100,
+    def get_recent_messages(
+            self,
+            channel: str,
+            limit: int = 100,
     ) -> List[Tuple[bytes, int, str, str, str, float]]:
         """
-        Return the most recent `limit` messages in `channel`, ordered oldest->newest.
+        Return latest messages in a channel, newest last.
         """
         sql = """
         SELECT origin_id, seqno, channel, nick, text, ts
         FROM chat_messages
         WHERE channel = ?
-        ORDER BY ts DESC
+        ORDER BY ts ASC
         LIMIT ?;
         """
         cur = self._conn.execute(sql, (channel, limit))
         rows = cur.fetchall()
-        rows.reverse()  # oldest -> newest for UI rendering
         return rows
 
-    def get_recent_messages(
-        self,
-        channel: str,
-        limit: int = 100,
+    def get_last_n_messages(
+            self,
+            channel: str,
+            n: int,
     ) -> List[Tuple[bytes, int, str, str, str, float]]:
         """
-        Backwards-compatible name used by the GUI/backend: returns newest `limit`, oldest->newest.
+        Compatibility wrapper: return the last N messages for a channel (newest last).
+
+        Some higher-level layers call this name; internally we store/retrieve using
+        :meth:`get_recent_messages`.
         """
-        return self.get_last_n_messages(channel, limit)
+        return self.get_recent_messages(channel=channel, limit=n)
 
     def get_messages_since(
-        self,
-        channel: str,
-        since_ts: float,
-        limit: int = 100,
+            self,
+            channel: str,
+            since_ts: float,
+            limit: int = 100,
     ) -> List[Tuple[bytes, int, str, str, str, float]]:
         """
         Return messages in a channel with ts > since_ts, ordered by ts.
@@ -138,6 +142,39 @@ class ChatStore:
         rows = cur.fetchall()
         return [str(r[0]) for r in rows]
 
+    def prune_keep_last_n_per_channel(self, keep_last_n: int) -> int:
+        """
+        Prune the database by keeping only the most recent `keep_last_n` messages
+        per channel/DM (as identified by the `channel` column).
+
+        Returns:
+            Number of rows deleted.
+        """
+        if keep_last_n < 1:
+            raise ValueError("keep_last_n must be >= 1")
+
+        # Determine channels first (including DMs, which are stored as channels)
+        channels = self.list_channels(limit=10_000)
+        deleted_total = 0
+
+        for chan in channels:
+            # Delete all rows for this channel whose id is not in the newest keep_last_n.
+            # Use a subquery selecting newest rows by ts (and id as a tiebreaker).
+            delete_sql = """
+            DELETE FROM chat_messages
+            WHERE channel = ?
+              AND id NOT IN (
+                SELECT id FROM chat_messages
+                WHERE channel = ?
+                ORDER BY ts DESC, id DESC
+                LIMIT ?
+              );
+            """
+            cur = self._conn.execute(delete_sql, (chan, chan, keep_last_n))
+            deleted_total += int(cur.rowcount if cur.rowcount is not None else 0)
+
+        self._conn.commit()
+        return deleted_total
+
     def close(self) -> None:
         self._conn.close()
-

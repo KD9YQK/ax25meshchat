@@ -84,6 +84,14 @@ class BackendInterface:
         """Ask backend to emit HistoryEvent for a channel/DM."""
         raise NotImplementedError
 
+    def request_sync_for_channel(self, channel: str) -> None:
+        """Request a network sync (last-N inventory) for a channel/DM tab."""
+        raise NotImplementedError
+
+    def prune_db(self) -> None:
+        """Prune the local chat database (manual, user-confirmed)."""
+        raise NotImplementedError
+
 
 # ============================================================
 # MeshChatBackend
@@ -117,12 +125,14 @@ class MeshChatBackend(BackendInterface):
         self._last_channels: List[str] = []
         # Latest discovered mapping: callsign -> node_id
         self._discovered_node_ids: Dict[str, bytes] = {}
-        # Sync throttling: (callsign, channel) -> last_sync_time (epoch seconds)
+        # Per-peer/per-channel sync cooldown tracking
         self._last_sync_time: Dict[Tuple[str, str], float] = {}
+
         # Instantiate client with callback into UI queue
         self._client = MeshChatClient(
             config=config,
             on_chat_message=self._on_chat_message,
+            on_sync_applied=self._on_sync_applied,
         )
 
         # Run MeshChatClient.start() in its own thread
@@ -269,6 +279,12 @@ class MeshChatBackend(BackendInterface):
     def _emit_status(self, text: str) -> None:
         self._ui_queue.put(StatusEvent(text=text))
 
+    def _on_sync_applied(self, channel: str, applied_count: int) -> None:
+        """Callback from MeshChatClient when a SYNC_RESPONSE is applied to the DB."""
+        self._emit_status(f"Sync applied for {channel}: {applied_count} new message(s)")
+        # Sync can introduce new channels/DMs; refresh left-list.
+        self._refresh_channels_from_db()
+
     def _status_loop(self) -> None:
         while self._running:
             time.sleep(self._status_interval)
@@ -291,74 +307,33 @@ class MeshChatBackend(BackendInterface):
             # Save mapping for DM fallback
             self._discovered_node_ids = {k: v[0] for k, v in discovered.items()}
 
+            prev_nodes = set(self._last_nodes)
             nodes = sorted(discovered.keys())
             if nodes != self._last_nodes:
-                # detect newly seen callsigns
-                old_set = set(self._last_nodes)
-                new_set = set(nodes)
-                newly_seen = sorted(new_set - old_set)
-
                 self._last_nodes = nodes
                 self._ui_queue.put(NodeListEvent(nodes=nodes))
-
-                # Auto-sync on new peer (if enabled)
-                self._maybe_auto_sync_new_peers(newly_seen)
-
-    def _maybe_auto_sync_new_peers(self, newly_seen: List[str]) -> None:
-        cfg = self._config
-
-        # Respect config
-        if not getattr(cfg, "sync_enabled", True):
-            return
-        if not getattr(cfg, "sync_auto_sync_on_new_peer", True):
-            return
-        if not newly_seen:
-            return
-
-        last_n = int(getattr(cfg, "sync_last_n_messages", 200))
-        if last_n <= 0:
-            return
-
-        min_interval = float(getattr(cfg, "sync_min_sync_interval_seconds", 30.0))
-        if min_interval < 0.0:
-            min_interval = 0.0
-
-        # Keep it minimal and safe: auto-sync only normal channels (not DMs)
-        # Start with #general plus any other known local channels that begin with '#'.
-        # Build channel list from DB at sync time (do not rely on cached GUI state)
-        try:
-            local_channels = self._client.get_local_channels()
-        except (OSError, ValueError):
-            local_channels = []
-
-        channels_to_sync: List[str] = ["#general"]
-        for c in local_channels:
-            if isinstance(c, str) and c.startswith("#") and c not in channels_to_sync:
-                channels_to_sync.append(c)
-
-        now = time.time()
-
-        for callsign in newly_seen:
-            node_id = self._discovered_node_ids.get(callsign)
-            if node_id is None:
-                continue
-
-            for channel in channels_to_sync:
-                key = (callsign, channel)
-                last_ts = self._last_sync_time.get(key)
-                if last_ts is not None and (now - last_ts) < min_interval:
-                    continue
-
-                try:
-                    self._client.request_sync_last_n(
-                        dest_node_id=node_id,
-                        channel=channel,
-                        last_n=last_n,
-                    )
-                    self._last_sync_time[key] = now
-                except (OSError, ValueError):
-                    # No broad exceptions; just skip this peer/channel this tick.
-                    continue
+            new_peers = sorted(set(nodes) - prev_nodes)
+            if new_peers:
+                cfg = self._config
+                if getattr(cfg, "sync_enabled", True) and getattr(cfg, "sync_auto_sync_on_new_peer", True):
+                    channel = "#general"
+                    last_n = int(getattr(cfg, "sync_last_n_messages", 200))
+                    min_interval = float(getattr(cfg, "sync_min_sync_interval_seconds", 30.0))
+                    now = time.time()
+                    for callsign in new_peers:
+                        node_id = self._discovered_node_ids.get(callsign)
+                        if not node_id:
+                            continue
+                        key = (callsign, channel)
+                        last_ts = self._last_sync_time.get(key)
+                        if last_ts is not None and (now - last_ts) < min_interval:
+                            continue
+                        try:
+                            self._client.request_sync_last_n(dest_node_id=node_id, channel=channel, last_n=last_n)
+                            self._last_sync_time[key] = now
+                            self._emit_status(f"Auto-sync requested for {channel} from {callsign}")
+                        except (OSError, ValueError) as exc:
+                            self._emit_status(f"Auto-sync request failed for {channel} from {callsign}: {exc}")
 
     def request_history(self, channel: str, limit: int = 200) -> None:
         """Emit a HistoryEvent for `channel` based on local SQLite history.
@@ -371,6 +346,88 @@ class MeshChatBackend(BackendInterface):
         except (OSError, ValueError):
             return
         self._ui_queue.put(HistoryEvent(channel=channel, messages=msgs))
+
+    def request_sync_for_channel(self, channel: str) -> None:
+        """
+        Trigger a network sync for the given channel/DM tab.
+
+        - For DMs ("@CALLSIGN"): sync is requested from that specific node (if known).
+        - For normal channels ("#general"): sync is requested from the default peer.
+        """
+        cfg = self._config
+        if not getattr(cfg, "sync_enabled", True):
+            return
+
+        last_n = int(getattr(cfg, "sync_last_n_messages", 200))
+        if last_n <= 0:
+            return
+
+        min_interval = float(getattr(cfg, "sync_min_sync_interval_seconds", 30.0))
+        if min_interval < 0.0:
+            min_interval = 0.0
+
+        now = time.time()
+
+        # DM
+        if channel.startswith("@") and len(channel) > 1:
+            callsign = channel[1:]
+            node_id = self._discovered_node_ids.get(callsign)
+            if node_id is None:
+                self._emit_status(f"Cannot sync {channel}: destination not discovered yet.")
+                return
+
+            key = (callsign, channel)
+            last_ts = self._last_sync_time.get(key)
+            if last_ts is not None and (now - last_ts) < min_interval:
+                return
+
+            try:
+                self._client.request_sync_last_n(dest_node_id=node_id, channel=channel, last_n=last_n)
+                self._last_sync_time[key] = now
+                self._emit_status(f"Sync requested for {channel} from {callsign}")
+            except (OSError, ValueError) as exc:
+                self._emit_status(f"Sync request failed for {channel}: {exc}")
+            return
+
+        # Channel
+        try:
+            default_peer = cfg.peers[self._default_peer_nick]
+        except KeyError:
+            self._emit_status("Cannot sync: default peer is not configured.")
+            return
+
+        peer_label = self._default_peer_nick
+        key = (peer_label, channel)
+        last_ts = self._last_sync_time.get(key)
+        if last_ts is not None and (now - last_ts) < min_interval:
+            return
+
+        try:
+            self._client.request_sync_last_n(dest_node_id=default_peer.node_id, channel=channel, last_n=last_n)
+            self._last_sync_time[key] = now
+            self._emit_status(f"Sync requested for {channel} from {peer_label}")
+        except (OSError, ValueError) as exc:
+            self._emit_status(f"Sync request failed for {channel}: {exc}")
+
+    def prune_db(self) -> None:
+        """
+        Manually prune the local SQLite chat database.
+
+        Policy: keep the most recent N messages per channel/DM, where N is
+        taken from chat.sync.last_n_messages (or its default).
+        """
+        keep_last_n = int(getattr(self._config, "sync_last_n_messages", 200))
+        if keep_last_n < 1:
+            keep_last_n = 1
+
+        try:
+            deleted = self._client.prune_db_keep_last_n_per_channel(keep_last_n)
+        except (OSError, ValueError) as exc:
+            self._emit_status(f"DB prune failed: {exc}")
+            return
+
+        self._emit_status(f"DB pruned: deleted {deleted} rows (kept last {keep_last_n} per channel).")
+        self._refresh_channels_from_db()
 
     def _emit_initial_channels(self) -> None:
         """Send ChannelListEvent based on SQLite so GUI can restore left list."""

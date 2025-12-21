@@ -45,6 +45,7 @@ class MeshChatConfig:
     sync_auto_sync_on_new_peer: bool = True
     sync_min_sync_interval_seconds: float = 30.0
 
+
 class MeshChatClient:
     """
     IRC-style chat client on top of MeshNode with:
@@ -55,15 +56,17 @@ class MeshChatClient:
     """
 
     def __init__(
-        self,
-        config: MeshChatConfig,
-        on_chat_message: Callable[[ChatMessage, bytes, float], None],
+            self,
+            config: MeshChatConfig,
+            on_chat_message: Callable[[ChatMessage, bytes, float], None],
+            on_sync_applied: Optional[Callable[[str, int], None]] = None,
     ) -> None:
         """
         on_chat_message(ChatMessage, origin_id, ts)
         """
         self._config = config
         self._on_chat_message = on_chat_message
+        self._on_sync_applied = on_sync_applied
         self._nick = config.mesh_node_config.callsign  # default nick
 
         self._store = ChatStore(config.db_path)
@@ -94,15 +97,19 @@ class MeshChatClient:
     def set_nick(self, nick: str) -> None:
         self._nick = nick
 
+    def get_node_id(self) -> bytes:
+        """Return our local 8-byte node ID."""
+        return getattr(self._mesh_node, "_node_id", b"")
+
     # --------------------------------------------------------------
     # Sending messages
     # --------------------------------------------------------------
 
     def send_message_to_peer(
-        self,
-        peer_nick: str,
-        channel: str,
-        text: str,
+            self,
+            peer_nick: str,
+            channel: str,
+            text: str,
     ) -> None:
         peer = self._config.peers.get(peer_nick)
         if peer is None:
@@ -110,10 +117,10 @@ class MeshChatClient:
         self.send_message_to_node(peer.node_id, channel, text)
 
     def send_message_to_node(
-        self,
-        dest_node_id: bytes,
-        channel: str,
-        text: str,
+            self,
+            dest_node_id: bytes,
+            channel: str,
+            text: str,
     ) -> None:
         msg = ChatMessage(
             msg_type=CHAT_TYPE_MESSAGE,
@@ -126,7 +133,7 @@ class MeshChatClient:
         # Log locally as "sent"
         now = time.time()
         self._store.add_message(
-            origin_id=self._mesh_node._node_id,  # you may want a public accessor
+            origin_id=self.get_node_id(),
             seqno=int(data_seqno),
             channel=channel,
             nick=self._nick,
@@ -139,10 +146,10 @@ class MeshChatClient:
     # --------------------------------------------------------------
 
     def request_sync(
-        self,
-        dest_node_id: bytes,
-        channel: str,
-        since_ts: float,
+            self,
+            dest_node_id: bytes,
+            channel: str,
+            since_ts: float,
     ) -> None:
         """
         v1: Ask a peer for messages in `channel` after `since_ts`.
@@ -151,10 +158,10 @@ class MeshChatClient:
         self._mesh_node.send_application_data(dest_node_id, payload)
 
     def request_sync_last_n(
-        self,
-        dest_node_id: bytes,
-        channel: str,
-        last_n: Optional[int] = None,
+            self,
+            dest_node_id: bytes,
+            channel: str,
+            last_n: Optional[int] = None,
     ) -> None:
         """
         v2: Ask a peer for missing messages within the last N window using seqno inventory.
@@ -167,7 +174,7 @@ class MeshChatClient:
             return
 
         # Build inventory from our local last-N window for this channel
-        rows = self._store.get_last_n_messages(channel, limit=int(last_n))
+        rows = self._store.get_last_n_messages(channel, int(last_n))
         inv: Dict[str, int] = {}
         for origin_id, seqno, _channel, _nick, _text, _ts in rows:
             key = origin_id.hex()
@@ -184,10 +191,10 @@ class MeshChatClient:
         self._mesh_node.send_application_data(dest_node_id, payload)
 
     def request_sync_from_peer(
-        self,
-        peer_nick: str,
-        channel: str,
-        since_ts: float,
+            self,
+            peer_nick: str,
+            channel: str,
+            since_ts: float,
     ) -> None:
         peer = self._config.peers.get(peer_nick)
         if peer is None:
@@ -195,10 +202,10 @@ class MeshChatClient:
         self.request_sync(peer.node_id, channel, since_ts)
 
     def request_sync_last_n_from_peer(
-        self,
-        peer_nick: str,
-        channel: str,
-        last_n: Optional[int] = None,
+            self,
+            peer_nick: str,
+            channel: str,
+            last_n: Optional[int] = None,
     ) -> None:
         peer = self._config.peers.get(peer_nick)
         if peer is None:
@@ -206,9 +213,9 @@ class MeshChatClient:
         self.request_sync_last_n(peer.node_id, channel, last_n=last_n)
 
     def get_local_history(
-        self,
-        channel: str,
-        limit: int = 100,
+            self,
+            channel: str,
+            limit: int = 100,
     ) -> List[Tuple[bytes, int, str, str, str, float]]:
         """
         Return local history for UI: list of
@@ -221,6 +228,15 @@ class MeshChatClient:
         Return locally-known channel identifiers from the SQLite store.
         """
         return self._store.list_channels(limit=limit)
+
+    def prune_db_keep_last_n_per_channel(self, keep_last_n: int) -> int:
+        """
+        Manually prune the local chat database. Keeps the most recent `keep_last_n`
+        messages per channel/DM.
+
+        Returns number of rows deleted.
+        """
+        return self._store.prune_keep_last_n_per_channel(int(keep_last_n))
 
     def get_discovered_nodes(self) -> Dict[str, Tuple[bytes, float]]:
         """
@@ -236,22 +252,24 @@ class MeshChatClient:
         self_id = getattr(self._mesh_node, "_node_id", b"")
         results: Dict[str, Tuple[bytes, float]] = {}
 
+        # Originators
         for node_id, entry in getattr(state, "originators", {}).items():
             if node_id == self_id:
                 continue
-            last_seen = float(getattr(entry, "last_seen", 0.0))
             callsign = node_id.rstrip(b"\x00").decode("ascii", errors="ignore")
             if not callsign:
                 continue
+            last_seen = float(getattr(entry, "last_seen", 0.0))
             results[callsign] = (node_id, last_seen)
 
+        # Neighbors (merge, preferring newer last_seen)
         for node_id, entry in getattr(state, "neighbors", {}).items():
             if node_id == self_id:
                 continue
-            last_seen = float(getattr(entry, "last_seen", 0.0))
             callsign = node_id.rstrip(b"\x00").decode("ascii", errors="ignore")
             if not callsign:
                 continue
+            last_seen = float(getattr(entry, "last_seen", 0.0))
             prev = results.get(callsign)
             if prev is None or last_seen > prev[1]:
                 results[callsign] = (node_id, last_seen)
@@ -263,11 +281,11 @@ class MeshChatClient:
     # --------------------------------------------------------------
 
     def _on_mesh_app_data(
-        self,
-        origin_id: bytes,
-        _dest_id: bytes,
-        data_seqno: int,
-        payload: bytes,
+            self,
+            origin_id: bytes,
+            _dest_id: bytes,
+            data_seqno: int,
+            payload: bytes,
     ) -> None:
         msg = decode_chat_message(payload)
         if msg is None:
@@ -283,11 +301,11 @@ class MeshChatClient:
             self._handle_sync_response(msg)
 
     def _handle_incoming_chat_message(
-        self,
-        origin_id: bytes,
-        data_seqno: int,
-        msg: ChatMessage,
-        ts: float,
+            self,
+            origin_id: bytes,
+            data_seqno: int,
+            msg: ChatMessage,
+            ts: float,
     ) -> None:
         self._store.add_message(
             origin_id=origin_id,
@@ -300,9 +318,9 @@ class MeshChatClient:
         self._on_chat_message(msg, origin_id, ts)
 
     def _handle_sync_request(
-        self,
-        origin_id: bytes,
-        msg: ChatMessage,
+            self,
+            origin_id: bytes,
+            msg: ChatMessage,
     ) -> None:
         req = parse_sync_request_any(msg)
         if req is None:
@@ -344,7 +362,7 @@ class MeshChatClient:
             if last_n > int(self._config.sync_last_n_messages):
                 last_n = int(self._config.sync_last_n_messages)
 
-            window_rows = self._store.get_last_n_messages(msg.channel, limit=last_n)
+            window_rows = self._store.get_last_n_messages(msg.channel, last_n)
 
             inv = req.inv
             sent = 0
@@ -376,12 +394,14 @@ class MeshChatClient:
         self._mesh_node.send_application_data(origin_id, response_payload)
 
     def _handle_sync_response(
-        self,
-        msg: ChatMessage,
+            self,
+            msg: ChatMessage,
     ) -> None:
         records = parse_sync_response(msg)
         if records is None:
             return
+
+        applied = 0
 
         for record in records:
             origin_hex = record.get("origin_id_hex")
@@ -416,6 +436,7 @@ class MeshChatClient:
                 text=text_val,
                 ts=ts_float,
             )
+            applied += 1
 
             chat_msg = ChatMessage(
                 msg_type=CHAT_TYPE_MESSAGE,
@@ -424,3 +445,6 @@ class MeshChatClient:
                 text=text_val,
             )
             self._on_chat_message(chat_msg, origin_bytes, ts_float)
+
+        if applied > 0 and self._on_sync_applied is not None:
+            self._on_sync_applied(msg.channel, applied)

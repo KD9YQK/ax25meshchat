@@ -41,8 +41,7 @@ def encode_chat_message(msg: ChatMessage) -> bytes:
     header[2] = chan_len
     header[3] = nick_len
 
-    payload = bytes(header) + channel_bytes + nick_bytes + text_bytes
-    return payload
+    return bytes(header) + channel_bytes + nick_bytes + text_bytes
 
 
 def decode_chat_message(data: bytes) -> Optional[ChatMessage]:
@@ -66,15 +65,11 @@ def decode_chat_message(data: bytes) -> Optional[ChatMessage]:
     nick_bytes = data[header_len + chan_len: header_len + chan_len + nick_len]
     text_bytes = data[header_len + chan_len + nick_len:]
 
-    channel = channel_bytes.decode("utf-8", errors="replace")
-    nick = nick_bytes.decode("utf-8", errors="replace")
-    text = text_bytes.decode("utf-8", errors="replace")
-
     return ChatMessage(
         msg_type=msg_type,
-        channel=channel,
-        nick=nick,
-        text=text,
+        channel=channel_bytes.decode("utf-8", errors="replace"),
+        nick=nick_bytes.decode("utf-8", errors="replace"),
+        text=text_bytes.decode("utf-8", errors="replace"),
     )
 
 
@@ -131,8 +126,6 @@ def encode_sync_request_seqno(
 def parse_sync_request_any(msg: ChatMessage) -> Optional[SyncRequest]:
     """
     Parse either v1 {"since_ts": ...} or v2 {"mode":"seqno",...}.
-
-    Returns SyncRequest or None on error.
     """
     try:
         obj = json.loads(msg.text)
@@ -141,7 +134,6 @@ def parse_sync_request_any(msg: ChatMessage) -> Optional[SyncRequest]:
     if not isinstance(obj, dict):
         return None
 
-    # v2 inventory mode
     mode = obj.get("mode")
     if mode == "seqno":
         last_n = obj.get("last_n")
@@ -153,21 +145,29 @@ def parse_sync_request_any(msg: ChatMessage) -> Optional[SyncRequest]:
 
         inv_clean: Dict[str, int] = {}
         for k, v in inv.items():
-            if not isinstance(k, str):
-                continue
-            if not isinstance(v, int):
-                continue
-            inv_clean[k] = v
+            if isinstance(k, str) and isinstance(v, int):
+                inv_clean[k] = v
 
         return SyncRequest(mode="seqno", since_ts=None, last_n=int(last_n), inv=inv_clean)
 
-    # v1 since_ts
-    if "since_ts" not in obj:
+    # v1
+    since_ts = obj.get("since_ts")
+    if not isinstance(since_ts, (float, int)):
         return None
-    value = obj["since_ts"]
-    if not isinstance(value, (float, int)):
+    return SyncRequest(mode="since_ts", since_ts=float(since_ts), last_n=0, inv={})
+
+
+# Backward-compatible name for older code:
+def parse_sync_request(msg: ChatMessage) -> Optional[float]:
+    """
+    Old API expected by chat_client.py: returns since_ts or None.
+    """
+    req = parse_sync_request_any(msg)
+    if req is None:
         return None
-    return SyncRequest(mode="since_ts", since_ts=float(value), last_n=0, inv={})
+    if req.mode != "since_ts":
+        return None
+    return req.since_ts
 
 
 def encode_sync_response(
