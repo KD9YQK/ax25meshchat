@@ -16,18 +16,27 @@ from __future__ import annotations
 
 import argparse
 import binascii
+import random
+import heapq
 import socket
 import threading
 import time
+import zlib
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
+from chat_protocol import CHAT_TYPE_SYNC_REQUEST, decode_chat_message, parse_sync_request_any, ChatMessage, \
+    CHAT_TYPE_MESSAGE, encode_chat_message
 
 MAX_FRAME_LEN = 65535
 READ_CHUNK = 4096
 
 MESH_VERSION = 0x01
+MESH_MSG_DATA = 0x00
 MESH_MSG_OGM = 0x01
+
+MESH_FLAG_COMPRESSED = 0x01
+MESH_FLAG_ENCRYPTED = 0x02
 
 
 def _u16be(n: int) -> bytes:
@@ -65,6 +74,71 @@ def _ascii8(s: str) -> bytes:
     return b + (b"\x00" * (8 - len(b)))
 
 
+def _ascii_from_id8(b: bytes) -> str:
+    return b.split(b"\x00", 1)[0].decode("ascii", errors="replace")
+
+
+def _try_decode_sync_request(mesh_payload: bytes) -> Optional[str]:
+    """
+    Best-effort decoder for CHAT_TYPE_SYNC_REQUEST embedded in a mesh DATA frame.
+    Returns a human-readable one-liner, or None if not a sync request / not decodable.
+    """
+    if len(mesh_payload) < 16 + 12:
+        return None
+
+    ver = mesh_payload[0]
+    msg_type = mesh_payload[1]
+    flags = mesh_payload[2]
+    ttl = mesh_payload[3]
+    origin_id8 = mesh_payload[4:12]
+    seqno = int.from_bytes(mesh_payload[12:16], byteorder="big", signed=False)
+
+    if ver != MESH_VERSION or msg_type != MESH_MSG_DATA:
+        return None
+
+    body = mesh_payload[16:]
+    if len(body) < 12:
+        return None
+
+    dest_id8 = body[0:8]
+    data_seq = int.from_bytes(body[8:12], byteorder="big", signed=False)
+    app_bytes = body[12:]
+
+    origin = _ascii_from_id8(origin_id8)
+    dest = _ascii_from_id8(dest_id8)
+
+    if (flags & MESH_FLAG_ENCRYPTED) != 0:
+        return f"SYNC_REQUEST origin={origin} dest={dest} ttl={ttl} seqno={seqno} data_seq={data_seq} [encrypted]"
+
+    if (flags & MESH_FLAG_COMPRESSED) != 0:
+        try:
+            app_bytes = zlib.decompress(app_bytes)
+        except zlib.error:
+            return None
+
+    chat_msg = decode_chat_message(app_bytes)
+    if chat_msg is None or chat_msg.msg_type != CHAT_TYPE_SYNC_REQUEST:
+        return None
+
+    req = parse_sync_request_any(chat_msg)
+    if req is None:
+        return None
+
+    if req.mode == "since_ts":
+        return (
+            f"SYNC_REQUEST(v1 since_ts) origin={origin} dest={dest} channel={chat_msg.channel!r} "
+            f"nick={chat_msg.nick!r} since_ts={req.since_ts}"
+        )
+
+    inv_items = sorted(req.inv.items())
+    preview = ", ".join([f"{k}:{v}" for k, v in inv_items[:5]])
+    more = "" if len(inv_items) <= 5 else f" (+{len(inv_items) - 5} more)"
+    return (
+        f"SYNC_REQUEST(v2 seqno) origin={origin} dest={dest} channel={chat_msg.channel!r} nick={chat_msg.nick!r} "
+        f"last_n={req.last_n} inv={len(inv_items)} [{preview}{more}]"
+    )
+
+
 def build_mesh_header(*, msg_type: int, flags: int, ttl: int, origin_id8: bytes, seqno: int) -> bytes:
     if len(origin_id8) != 8:
         raise ValueError("origin_id8 must be exactly 8 bytes")
@@ -88,6 +162,42 @@ def build_fake_ogm(*, origin: str, seqno: int, ttl: int = 5, link_metric: int = 
     return header + prev_hop + lm
 
 
+def build_fake_data(
+        *,
+        origin: str,
+        dest: str,
+        seqno: int,
+        ttl: int,
+        app_payload: bytes,
+        compress: bool = True,
+) -> bytes:
+    """
+    DATA payload (matches mesh_node.py):
+      header(16) + dest_id(8) + data_seqno(u32be) + [payload...]
+    This helper sends unencrypted payloads (no nonce/ciphertext).
+    """
+    origin8 = _ascii8(origin)
+    dest8 = _ascii8(dest)
+
+    flags = 0
+    payload_to_send = app_payload
+    if compress and app_payload:
+        compressed = zlib.compress(app_payload)
+        if len(compressed) < len(app_payload):
+            payload_to_send = compressed
+            flags |= MESH_FLAG_COMPRESSED
+
+    header = build_mesh_header(
+        msg_type=MESH_MSG_DATA,
+        flags=flags,
+        ttl=ttl,
+        origin_id8=origin8,
+        seqno=seqno,
+    )
+    body = dest8 + _u32be(seqno) + payload_to_send
+    return header + body
+
+
 @dataclass
 class ClientState:
     addr: Tuple[str, int]
@@ -98,22 +208,54 @@ class ClientState:
 
 class FakeArdopServer:
     def __init__(
-        self,
-        host: str,
-        port: int,
-        *,
-        echo: bool,
-        broadcast: bool,
-        fake_ogm: bool,
-        fake_ogm_id: str,
-        fake_ogm_interval_s: float,
-        fake_ogm_ttl: int,
-        fake_ogm_metric: int,
+            self,
+            host: str,
+            port: int,
+            *,
+            echo: bool,
+            broadcast: bool,
+            drop_rate: float,
+            base_delay_ms: int,
+            jitter_ms: int,
+            reorder_rate: float,
+            reorder_max_delay_ms: int,
+            fake_ogm: bool,
+            fake_ogm_id: str,
+            fake_ogm_interval_s: float,
+            fake_ogm_ttl: int,
+            fake_ogm_metric: int,
     ) -> None:
         self._host = host
         self._port = port
         self._echo = echo
         self._broadcast = broadcast
+
+        if drop_rate < 0.0:
+            drop_rate = 0.0
+        if drop_rate > 1.0:
+            drop_rate = 1.0
+        if base_delay_ms < 0:
+            base_delay_ms = 0
+        if jitter_ms < 0:
+            jitter_ms = 0
+
+        self._drop_rate = float(drop_rate)
+        self._base_delay_ms = int(base_delay_ms)
+        self._jitter_ms = int(jitter_ms)
+
+        if reorder_rate < 0.0:
+            reorder_rate = 0.0
+        if reorder_rate > 1.0:
+            reorder_rate = 1.0
+        if reorder_max_delay_ms < 0:
+            reorder_max_delay_ms = 0
+
+        self._reorder_rate = float(reorder_rate)
+        self._reorder_max_delay_ms = int(reorder_max_delay_ms)
+
+        self._txq_lock = threading.Lock()
+        self._txq: list[tuple[float, socket.socket, bytes]] = []
+        self._txq_wake = threading.Event()
 
         self._fake_ogm = fake_ogm
         self._fake_ogm_id = fake_ogm_id
@@ -128,6 +270,79 @@ class FakeArdopServer:
         self._clients_lock = threading.Lock()
         self._clients: Dict[socket.socket, ClientState] = {}
 
+    def _maybe_delay(self) -> None:
+        delay_ms = self._base_delay_ms
+        if self._jitter_ms > 0:
+            delay_ms += int(random.uniform(0.0, float(self._jitter_ms)))
+        if delay_ms > 0:
+            time.sleep(delay_ms / 1000.0)
+
+    def _should_drop(self) -> bool:
+        if self._drop_rate <= 0.0:
+            return False
+        return random.random() < self._drop_rate
+
+    def _compute_total_delay_s(self) -> float:
+        """Compute total delay in seconds including base delay, jitter, and optional reorder delay."""
+        delay_ms = self._base_delay_ms
+        if self._jitter_ms > 0:
+            delay_ms += int(random.uniform(0.0, float(self._jitter_ms)))
+        # Reorder simulation: probabilistically add extra delay to some frames so later frames can overtake.
+        if self._reorder_rate > 0.0 and random.random() < self._reorder_rate:
+            if self._reorder_max_delay_ms > 0:
+                delay_ms += int(random.uniform(0.0, float(self._reorder_max_delay_ms)))
+        if delay_ms <= 0:
+            return 0.0
+        return float(delay_ms) / 1000.0
+
+    def _tx_scheduler_loop(self) -> None:
+        """Background loop that sends scheduled frames when their send_at time arrives."""
+        while not self._stop.is_set():
+            now = time.time()
+            due: list[tuple[float, socket.socket, bytes]] = []
+            next_send_at: Optional[float] = None
+
+            with self._txq_lock:
+                if self._txq:
+                    # Partition due items; keep the rest.
+                    remaining: list[tuple[float, socket.socket, bytes]] = []
+                    for send_at, sock, data in self._txq:
+                        if send_at <= now:
+                            due.append((send_at, sock, data))
+                        else:
+                            remaining.append((send_at, sock, data))
+                            if next_send_at is None or send_at < next_send_at:
+                                next_send_at = send_at
+                    self._txq = remaining
+
+                # Reset wake event after we snapshot queue.
+                self._txq_wake.clear()
+
+            # Send due items outside the lock.
+            for _send_at, sock, data in due:
+                with self._clients_lock:
+                    st = self._clients.get(sock)
+                if st is None:
+                    continue
+                try:
+                    sock.sendall(data)
+                    st.last_tx = time.time()
+                except OSError:
+                    with self._clients_lock:
+                        if sock in self._clients:
+                            self._drop_client(sock)
+
+            # Sleep until next event / due time.
+            if next_send_at is None:
+                # Nothing queued; wait for new work.
+                self._txq_wake.wait(0.25)
+            else:
+                wait_s = next_send_at - time.time()
+                if wait_s <= 0.0:
+                    continue
+                # Wake early if new tasks arrive.
+                self._txq_wake.wait(wait_s if wait_s < 0.25 else 0.25)
+
     def start(self) -> None:
         self._srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -135,6 +350,8 @@ class FakeArdopServer:
         self._srv_sock.listen(10)
         print(f"[fake_ardopc] listening on {self._host}:{self._port}")
         threading.Thread(target=self._accept_loop, daemon=True).start()
+
+        threading.Thread(target=self._tx_scheduler_loop, daemon=True).start()
 
         if self._fake_ogm:
             threading.Thread(target=self._fake_ogm_loop, daemon=True).start()
@@ -182,14 +399,26 @@ class FakeArdopServer:
 
     def send_to_all(self, payload: bytes) -> None:
         data = _frame(payload)
-        dead = []
+        dead: list[socket.socket] = []
         with self._clients_lock:
             for c, st in self._clients.items():
                 try:
-                    c.sendall(data)
-                    st.last_tx = time.time()
+                    if self._should_drop():
+                        continue
+
+                    total_delay_s = self._compute_total_delay_s()
+                    if total_delay_s <= 0.0:
+                        c.sendall(data)
+                        st.last_tx = time.time()
+                    else:
+                        # Schedule send to allow reordering between frames
+                        send_at = time.time() + total_delay_s
+                        with self._txq_lock:
+                            heapq.heappush(self._txq, (send_at, c, data))
+                            self._txq_wake.set()
                 except OSError:
                     dead.append(c)
+
             for c in dead:
                 self._drop_client(c)
 
@@ -200,8 +429,17 @@ class FakeArdopServer:
         if st is None:
             return
         try:
-            c.sendall(data)
-            st.last_tx = time.time()
+            if self._should_drop():
+                return
+            total_delay_s = self._compute_total_delay_s()
+            if total_delay_s <= 0.0:
+                c.sendall(data)
+                st.last_tx = time.time()
+            else:
+                send_at = time.time() + total_delay_s
+                with self._txq_lock:
+                    heapq.heappush(self._txq, (send_at, c, data))
+                    self._txq_wake.set()
         except OSError:
             with self._clients_lock:
                 if c in self._clients:
@@ -241,6 +479,10 @@ class FakeArdopServer:
 
                 print(f"[fake_ardopc] RX from {st.addr}: {len(payload)} bytes: {_hex(payload)}")
 
+                sync_desc = _try_decode_sync_request(payload)
+                if sync_desc is not None:
+                    print(f"[fake_ardopc] {sync_desc}")
+
                 if self._echo:
                     self.send_to_one(c, payload)
                 if self._broadcast:
@@ -274,6 +516,44 @@ class FakeArdopServer:
         try:
             while not self._stop.is_set():
                 line = input().strip()
+                # Command mode: keep hex injection behavior, but support a few helpers.
+                # - burst <origin> <dest> <channel> <count> <text...>
+                #   Sends <count> CHAT_TYPE_MESSAGE frames with incrementing seqnos.
+                if line.startswith('burst '):
+                    parts = line.split(' ', 5)
+                    if len(parts) < 6:
+                        print('[fake_ardopc] usage: burst <origin> <dest> <channel> <count> <text...>')
+                        continue
+                    _, origin, dest, channel, count_s, text_prefix = parts
+                    try:
+                        count = int(count_s)
+                    except ValueError:
+                        print('[fake_ardopc] invalid count')
+                        continue
+                    if count <= 0:
+                        print('[fake_ardopc] count must be > 0')
+                        continue
+                    # Generate a per-origin seqno stream for scripted injection.
+                    if not hasattr(self, '_inject_seqnos'):
+                        setattr(self, '_inject_seqnos', {})
+                    inject_seqnos = getattr(self, '_inject_seqnos')
+                    origin8 = _ascii8(origin)
+                    seqno = inject_seqnos.get(origin8, 1)
+                    for i_msg in range(count):
+                        msg = ChatMessage(
+                            msg_type=CHAT_TYPE_MESSAGE,
+                            channel=channel,
+                            nick=origin,
+                            text=f"{text_prefix} {i_msg + 1}/{count}",
+                        )
+                        app = encode_chat_message(msg)
+                        mesh = build_fake_data(origin=origin, dest=dest, seqno=seqno, ttl=5, app_payload=app,
+                                               compress=True)
+                        self.send_to_all(mesh)
+                        seqno = (seqno + 1) & 0xFFFFFFFF
+                    inject_seqnos[origin8] = seqno
+                    print(f"[fake_ardopc] BURST sent {count} msg(s) origin={origin} dest={dest} channel={channel}")
+                    continue
                 if not line:
                     continue
                 try:
@@ -295,8 +575,19 @@ def main() -> int:
     ap.add_argument("--broadcast", action="store_true", help="broadcast received frames to all clients")
     ap.add_argument("--stdin-inject", action="store_true", help="enable interactive hex injection via stdin")
 
+    ap.add_argument("--drop-rate", type=float, default=0.0, help="drop outgoing frames with this probability (0.0-1.0)")
+    ap.add_argument("--delay-ms", type=int, default=0, help="base delay added before every outgoing frame send")
+    ap.add_argument("--jitter-ms", type=int, default=0,
+                    help="additional random delay (0..jitter-ms) per outgoing frame")
+
+    ap.add_argument("--reorder-rate", type=float, default=0.0,
+                    help="probability to add extra delay to a frame to induce reordering (0.0-1.0)")
+    ap.add_argument("--reorder-max-delay-ms", type=int, default=0,
+                    help="maximum extra delay (0..N ms) applied when reorder triggers")
+
     ap.add_argument("--fake-ogm", action="store_true", help="periodically inject a fake OGM (mesh_node-compatible)")
-    ap.add_argument("--fake-ogm-id", default="NOCALL-1", help="fake node ID (ASCII; will be padded/truncated to 8 bytes)")
+    ap.add_argument("--fake-ogm-id", default="NOCALL-1",
+                    help="fake node ID (ASCII; will be padded/truncated to 8 bytes)")
     ap.add_argument("--fake-ogm-interval", type=float, default=5.0, help="seconds between fake OGM broadcasts")
     ap.add_argument("--fake-ogm-ttl", type=int, default=5, help="TTL for fake OGM packet (0-255)")
     ap.add_argument("--fake-ogm-metric", type=int, default=255, help="link metric byte for fake OGM (0-255)")
@@ -308,6 +599,11 @@ def main() -> int:
         args.port,
         echo=args.echo,
         broadcast=args.broadcast,
+        drop_rate=args.drop_rate,
+        base_delay_ms=args.delay_ms,
+        jitter_ms=args.jitter_ms,
+        reorder_rate=args.reorder_rate,
+        reorder_max_delay_ms=args.reorder_max_delay_ms,
         fake_ogm=args.fake_ogm,
         fake_ogm_id=args.fake_ogm_id,
         fake_ogm_interval_s=args.fake_ogm_interval,

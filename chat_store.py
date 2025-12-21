@@ -79,31 +79,27 @@ class ChatStore:
             limit: int = 100,
     ) -> List[Tuple[bytes, int, str, str, str, float]]:
         """
-        Return latest messages in a channel, newest last.
+        Return the most recent messages in a channel, ordered oldest → newest.
+
+        Note:
+            This returns the *last* `limit` messages (newest messages), not the first `limit`
+            rows in the database. Internally we select newest-first with a LIMIT, then
+            reorder ascending for display.
         """
         sql = """
         SELECT origin_id, seqno, channel, nick, text, ts
-        FROM chat_messages
-        WHERE channel = ?
-        ORDER BY ts ASC
-        LIMIT ?;
+        FROM (
+            SELECT origin_id, seqno, channel, nick, text, ts, id
+            FROM chat_messages
+            WHERE channel = ?
+            ORDER BY ts DESC, id DESC
+            LIMIT ?
+        )
+        ORDER BY ts ASC, id ASC;
         """
         cur = self._conn.execute(sql, (channel, limit))
         rows = cur.fetchall()
         return rows
-
-    def get_last_n_messages(
-            self,
-            channel: str,
-            n: int,
-    ) -> List[Tuple[bytes, int, str, str, str, float]]:
-        """
-        Compatibility wrapper: return the last N messages for a channel (newest last).
-
-        Some higher-level layers call this name; internally we store/retrieve using
-        :meth:`get_recent_messages`.
-        """
-        return self.get_recent_messages(channel=channel, limit=n)
 
     def get_messages_since(
             self,

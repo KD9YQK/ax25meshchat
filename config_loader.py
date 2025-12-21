@@ -11,6 +11,7 @@ from typing import Dict, Any
 import binascii
 
 import yaml  # pip install pyyaml
+from pathlib import Path
 
 from mesh_config import (
     ArdopConnectionConfig,
@@ -157,7 +158,8 @@ def load_chat_config_from_yaml(path: str) -> MeshChatConfig:
     else:
         chat_cfg_raw = chat_cfg_any
 
-    db_path = str(_get_required(chat_cfg_raw, "db_path"))
+    raw_db_path = str(_get_required(chat_cfg_raw, "db_path"))
+    db_path = str(Path(path).parent.joinpath(raw_db_path).resolve())
 
     # ---- sync config (optional) ----
     sync_any = chat_cfg_raw.get("sync", {})

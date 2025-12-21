@@ -59,7 +59,6 @@ class ChatFrame(wx.Frame):
         # Preload local history for #general (does not steal focus)
         try:
             self.backend.request_history("#general", limit=200)
-            self._history_loaded.add("#general")
         except AttributeError:
             pass
 
@@ -229,7 +228,6 @@ class ChatFrame(wx.Frame):
         if name != self._status_tab_name and name not in self._history_loaded:
             try:
                 self.backend.request_history(name, limit=200)
-                self._history_loaded.add(name)
             except AttributeError:
                 pass
 
@@ -322,7 +320,6 @@ class ChatFrame(wx.Frame):
                 self.backend.request_history(name, limit=200)
             except AttributeError:
                 break
-
 
     # -----------------------------------------------------------------
     # Backend queue polling
