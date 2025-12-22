@@ -108,6 +108,8 @@ Intermediate nodes forward packets without modifying payload semantics.
 
 ## 8. Duplicate Suppression and Airtime Efficiency
 
+The protocol also supports **targeted synchronization of missing messages**. When gaps are detected in received message sequences, nodes may request only the specific missing ranges rather than broad message inventories. This mechanism operates entirely at the application layer and is designed solely to reduce redundant transmissions and unnecessary airtime usage.
+
 To reduce redundant transmissions:
 
 - Each packet is uniquely identified by origin ID and sequence number

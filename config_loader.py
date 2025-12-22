@@ -244,25 +244,27 @@ def load_chat_config_from_yaml(path: str) -> MeshChatConfig:
         raise ValueError("chat.sync.max_send_per_response must be >= 1")
     if sync_min_sync_interval_seconds < 0.0:
         raise ValueError("chat.sync.min_sync_interval_seconds must be >= 0")
-    # -------------------------------
 
-    gap_related_any = sync_raw.get("gap_related", {})
-    if not isinstance(gap_related_any, dict):
-        gap_related_raw: Dict[str, Any] = {}
+    # ---- targeted sync (range) tuning (optional) ----
+    targeted_any = sync_raw.get("targeted_sync", {})
+    if not isinstance(targeted_any, dict):
+        targeted_raw: Dict[str, Any] = {}
     else:
-        gap_related_raw = gap_related_any
+        targeted_raw = targeted_any
 
-    gap_related_sync_enabled = bool(gap_related_raw.get("enabled", True))
-    gap_related_min_interval_seconds = float(gap_related_raw.get("min_interval_seconds", 120.0))
-    gap_related_jitter_seconds = float(gap_related_raw.get("jitter_seconds", 2.0))
-    gap_related_last_n_messages = int(gap_related_raw.get("last_n_messages", 0))
+    targeted_sync_enabled = bool(targeted_raw.get("enabled", True))
+    targeted_sync_merge_distance = int(targeted_raw.get("merge_distance", 0))
+    targeted_sync_max_range_len = int(targeted_raw.get("max_range_len", 50))
+    targeted_sync_max_requests_per_trigger = int(targeted_raw.get("max_requests_per_trigger", 3))
 
-    if gap_related_min_interval_seconds < 0.0:
-        raise ValueError("chat.sync.gap_related.min_interval_seconds must be >= 0")
-    if gap_related_jitter_seconds < 0.0:
-        raise ValueError("chat.sync.gap_related.jitter_seconds must be >= 0")
-    if gap_related_last_n_messages < 0:
-        raise ValueError("chat.sync.gap_related.last_n_messages must be >= 0")
+    if targeted_sync_merge_distance < 0:
+        raise ValueError("chat.sync.targeted_sync.merge_distance must be >= 0")
+    if targeted_sync_max_range_len < 1:
+        raise ValueError("chat.sync.targeted_sync.max_range_len must be >= 1")
+    if targeted_sync_max_requests_per_trigger < 1:
+        raise ValueError("chat.sync.targeted_sync.max_requests_per_trigger must be >= 1")
+    # -----------------------------------------------
+    # -------------------------------
 
     peers_raw_any = chat_cfg_raw.get("peers", {})
     if not isinstance(peers_raw_any, dict):
@@ -299,8 +301,9 @@ def load_chat_config_from_yaml(path: str) -> MeshChatConfig:
         sync_max_send_per_response=sync_max_send_per_response,
         sync_auto_sync_on_new_peer=sync_auto_sync_on_new_peer,
         sync_min_sync_interval_seconds=sync_min_sync_interval_seconds,
-        gap_related_sync_enabled=gap_related_sync_enabled,
-        gap_related_min_interval_seconds=gap_related_min_interval_seconds,
-        gap_related_jitter_seconds=gap_related_jitter_seconds,
-        gap_related_last_n_messages=gap_related_last_n_messages,
+        targeted_sync_enabled=targeted_sync_enabled,
+        targeted_sync_merge_distance=targeted_sync_merge_distance,
+        targeted_sync_max_range_len=targeted_sync_max_range_len,
+        targeted_sync_max_requests_per_trigger=targeted_sync_max_requests_per_trigger,
+
     )

@@ -20,6 +20,7 @@ from chat_protocol import (
     decode_chat_message,
     encode_sync_request,
     encode_sync_request_seqno,
+    encode_sync_request_range,
     parse_sync_request_any,
     encode_sync_response,
     parse_sync_response,
@@ -45,11 +46,21 @@ class MeshChatConfig:
     sync_auto_sync_on_new_peer: bool = True
     sync_min_sync_interval_seconds: float = 30.0
 
-    # Gap-Related Sync policy (Phase 1): when confirmed gaps should trigger a polite sync request.
+    # Gap-related sync policy (v2, policy layer)
     gap_related_sync_enabled: bool = True
     gap_related_min_interval_seconds: float = 120.0
     gap_related_jitter_seconds: float = 2.0
-    gap_related_last_n_messages: int = 0  # 0 => use sync_last_n_messages
+    # If >0, override sync_last_n_messages for gap-related last-N requests (policy layer)
+    gap_related_last_n_messages: int = 0
+
+    # Targeted sync (range) policy tuning
+    targeted_sync_enabled: bool = True
+    # Merge ranges if they are overlapping, adjacent, or within this many seqnos.
+    targeted_sync_merge_distance: int = 0
+    # Maximum inclusive length of any single requested range (end-start+1).
+    targeted_sync_max_range_len: int = 50
+    # Maximum number of range requests to emit per confirmed-gap trigger.
+    targeted_sync_max_requests_per_trigger: int = 3
 
 
 # --------------------------------------------------------------
@@ -275,7 +286,6 @@ class MeshChatClient:
             on_chat_message: Callable[[ChatMessage, bytes, float], None],
             on_sync_applied: Optional[Callable[[str, int], None]] = None,
             on_gap_report: Optional[Callable[[str], None]] = None,
-            on_gap_confirmed: Optional[Callable[[str, bytes, str], None]] = None,
     ) -> None:
         """
         on_chat_message(ChatMessage, origin_id, created_ts)
@@ -284,7 +294,6 @@ class MeshChatClient:
         self._on_chat_message = on_chat_message
         self._on_sync_applied = on_sync_applied
         self._on_gap_report = on_gap_report
-        self._on_gap_confirmed = on_gap_confirmed
         self._gap_tracker = _GapTracker()
         self._nick = config.mesh_node_config.callsign  # default nick
 
@@ -412,6 +421,35 @@ class MeshChatClient:
         )
         self._mesh_node.send_application_data(dest_node_id, payload)
 
+    def request_sync_range(
+            self,
+            dest_node_id: bytes,
+            channel: str,
+            origin_id: bytes,
+            start_seqno: int,
+            end_seqno: int,
+    ) -> None:
+        """
+        Targeted sync: ask a peer for a specific (origin_id, seqno range) within a channel.
+        """
+        if start_seqno > end_seqno:
+            start_seqno, end_seqno = end_seqno, start_seqno
+        if start_seqno < 0 or end_seqno < 0:
+            return
+
+        payload = encode_sync_request_range(
+            channel=channel,
+            nick=self._nick,
+            origin_id=origin_id,
+            start=int(start_seqno),
+            end=int(end_seqno),
+        )
+        self._mesh_node.send_application_data(dest_node_id, payload)
+
+    # --------------------------------------------------------------
+    # Convenience wrappers / DB helpers / mesh callback
+    # --------------------------------------------------------------
+
     def request_sync_from_peer(
             self,
             peer_nick: str,
@@ -498,9 +536,9 @@ class MeshChatClient:
 
         return results
 
-    # --------------------------------------------------------------
-    # Mesh app-data callback
-    # --------------------------------------------------------------
+        # --------------------------------------------------------------
+        # Mesh app-data callback
+        # --------------------------------------------------------------
 
     def _on_mesh_app_data(
             self,
@@ -571,6 +609,37 @@ class MeshChatClient:
             records_raw = self._store.get_messages_since(
                 channel=msg.channel,
                 since_ts=since_ts,
+                limit=max_send,
+            )
+            for origin_bytes, seqno, _channel, nick, text, ts in records_raw:
+                records.append(
+                    {
+                        "origin_id_hex": origin_bytes.hex(),
+                        "seqno": int(seqno),
+                        "nick": nick,
+                        "text": text,
+                        "ts": int(ts),
+                    }
+                )
+
+        elif req.mode == "range":
+            origin_hex = req.origin_id_hex
+            if origin_hex is None:
+                return
+            try:
+                want_origin = bytes.fromhex(origin_hex)
+            except ValueError:
+                return
+            start_seq = int(req.start)
+            end_seq = int(req.end)
+            if start_seq > end_seq:
+                start_seq, end_seq = end_seq, start_seq
+
+            records_raw = self._store.get_messages_for_origin_seq_range(
+                channel=msg.channel,
+                origin_id=want_origin,
+                start_seqno=start_seq,
+                end_seqno=end_seq,
                 limit=max_send,
             )
             for origin_bytes, seqno, _channel, nick, text, ts in records_raw:
@@ -676,8 +745,6 @@ class MeshChatClient:
                 for line in self._gap_tracker.on_seqno(origin_id=origin_bytes, seqno=seqno_int, now=float(recv_ts)):
                     if self._on_gap_report is not None:
                         self._on_gap_report(line)
-                    if self._on_gap_confirmed is not None and "(confirmed)" in line:
-                        self._on_gap_confirmed(msg.channel, origin_bytes, line)
 
             chat_msg = ChatMessage(
 

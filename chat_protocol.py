@@ -123,6 +123,10 @@ class SyncRequest:
     since_ts: Optional[float]
     last_n: int
     inv: Dict[str, int]
+    # mode="range" uses {"mode":"range","origin_id_hex":str,"start":int,"end":int}
+    origin_id_hex: Optional[str]
+    start: int
+    end: int
 
 
 def encode_sync_request(channel: str, nick: str, since_ts: float) -> bytes:
@@ -179,6 +183,25 @@ def parse_sync_request_any(msg: ChatMessage) -> Optional[SyncRequest]:
         return None
 
     mode = obj.get("mode")
+
+    if mode == "range":
+        origin_hex = obj.get("origin_id_hex")
+        start = obj.get("start")
+        end = obj.get("end")
+        if not isinstance(origin_hex, str):
+            return None
+        if not isinstance(start, int) or not isinstance(end, int):
+            return None
+        return SyncRequest(
+            mode="range",
+            since_ts=None,
+            last_n=0,
+            inv={},
+            origin_id_hex=origin_hex,
+            start=int(start),
+            end=int(end),
+        )
+
     if mode == "seqno":
         last_n = obj.get("last_n")
         inv = obj.get("inv")
@@ -192,13 +215,13 @@ def parse_sync_request_any(msg: ChatMessage) -> Optional[SyncRequest]:
             if isinstance(k, str) and isinstance(v, int):
                 inv_clean[k] = v
 
-        return SyncRequest(mode="seqno", since_ts=None, last_n=int(last_n), inv=inv_clean)
+        return SyncRequest(mode="seqno", since_ts=None, last_n=int(last_n), inv=inv_clean, origin_id_hex=None, start=0, end=0)
 
     # v1
     since_ts = obj.get("since_ts")
     if not isinstance(since_ts, (float, int)):
         return None
-    return SyncRequest(mode="since_ts", since_ts=float(since_ts), last_n=0, inv={})
+    return SyncRequest(mode="since_ts", since_ts=float(since_ts), last_n=0, inv={}, origin_id_hex=None, start=0, end=0)
 
 
 # Backward-compatible name for older code:
@@ -212,6 +235,38 @@ def parse_sync_request(msg: ChatMessage) -> Optional[float]:
     if req.mode != "since_ts":
         return None
     return req.since_ts
+
+
+
+def encode_sync_request_range(
+    channel: str,
+    nick: str,
+    origin_id: bytes,
+    start: int,
+    end: int,
+) -> bytes:
+    """
+    Targeted SYNC_REQUEST (v2 extension): text = JSON
+      {"mode":"range","origin_id_hex":str,"start":int,"end":int}
+
+    The envelope channel is used as the scope for the requested messages.
+    """
+    if start > end:
+        start, end = end, start
+    payload = {
+        "mode": "range",
+        "origin_id_hex": origin_id.hex(),
+        "start": int(start),
+        "end": int(end),
+    }
+    msg = ChatMessage(
+        msg_type=CHAT_TYPE_SYNC_REQUEST,
+        channel=channel,
+        nick=nick,
+        text=json.dumps(payload),
+        created_ts=int(time.time()),
+    )
+    return encode_chat_message(msg)
 
 
 def encode_sync_response(

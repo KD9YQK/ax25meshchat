@@ -4,7 +4,7 @@
 
 This project implements an experimental amateur radio mesh networking protocol designed to operate within FCC Part 97 regulations. The system prioritizes transparency, spectral efficiency, and operator accountability.
 
-The protocol supports low-bandwidth digital messaging over shared RF spectrum using conservative duty cycles and publicly documented formats.
+The protocol supports low-bandwidth digital messaging over shared RF spectrum using conservative duty cycles, publicly documented formats, and optional **targeted message recovery** to minimize redundant retransmissions.
 
 Chat messages include a sender-generated UTC creation timestamp used solely for human-readable display and deterministic history ordering; this metadata does not influence routing, transmission timing, or RF behavior.
 

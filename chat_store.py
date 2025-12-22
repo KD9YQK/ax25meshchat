@@ -178,6 +178,39 @@ class ChatStore:
         rows = cur.fetchall()
         rows.sort(key=lambda r: (r[6], r[0]))
         return [(r[1], int(r[2]), r[3], r[4], r[5], float(r[6])) for r in rows]
+    def get_messages_for_origin_seq_range(
+            self,
+            channel: str,
+            origin_id: bytes,
+            start_seqno: int,
+            end_seqno: int,
+            limit: int = 200,
+    ) -> List[Tuple[bytes, int, str, str, str, float]]:
+        """
+        Return messages for a specific origin_id within a seqno range (inclusive),
+        scoped to a channel, ordered by seqno ascending.
+
+        Used for targeted sync ("range" mode).
+        """
+        if start_seqno > end_seqno:
+            start_seqno, end_seqno = end_seqno, start_seqno
+        if limit <= 0:
+            return []
+        sql = """
+        SELECT origin_id, seqno, channel, nick, text, created_ts
+        FROM chat_messages
+        WHERE channel = ? AND origin_id = ? AND seqno >= ? AND seqno <= ?
+        ORDER BY seqno ASC
+        LIMIT ?;
+        """
+        cur = self._conn.execute(
+            sql, (channel, origin_id, int(start_seqno), int(end_seqno), int(limit))
+        )
+        rows = cur.fetchall()
+        return [(r[0], int(r[1]), r[2], r[3], r[4], float(r[5])) for r in rows]
+
+
+
 
     def list_channels(self, limit: int = 50) -> List[str]:
         """

@@ -24,11 +24,11 @@ chat:
     max_send_per_response: 200
     auto_sync_on_new_peer: true
     min_sync_interval_seconds: 30
-    gap_related:
+    targeted_sync:
       enabled: true
-      min_interval_seconds: 120
-      jitter_seconds: 2
-      last_n_messages: 0
+      merge_distance: 0
+      max_range_len: 50
+      max_requests_per_trigger: 3
   peers:
     bob:
       node_id_hex: '0011223344556677'

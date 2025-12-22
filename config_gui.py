@@ -57,6 +57,12 @@ TOOLTIPS: Dict[str, str] = {
     "chat.sync.max_send_per_response": "Maximum messages to include in any single sync response (caps burst size).",
     "chat.sync.auto_sync_on_new_peer": "If true, automatically initiate sync when a new peer is discovered.",
     "chat.sync.min_sync_interval_seconds": "Minimum seconds between sync attempts for the same peer/channel (cooldown).",
+
+    "chat.sync.targeted_sync": "Targeted sync (range-based) tuning. Controls how confirmed gaps are turned into range sync requests.",
+    "chat.sync.targeted_sync.enabled": "Enable targeted (range-based) sync. If false, the node will not issue range sync requests.",
+    "chat.sync.targeted_sync.merge_distance": "Coalescing distance (in seqno units). 0 merges only overlapping/adjacent ranges; larger values merge 'nearby' gaps to reduce request count.",
+    "chat.sync.targeted_sync.max_range_len": "Maximum length (seqnos) per individual range request. Larger values reduce request overhead but can increase response size.",
+    "chat.sync.targeted_sync.max_requests_per_trigger": "Maximum number of range requests sent per confirmed-gap trigger (caps burstiness on RF).",
     "chat.peers": "Known peers you want to address by nickname. Keys are local aliases (e.g., 'bob').",
     "chat.peer_key": "Local alias for the peer (used in config file; not transmitted).",
     "chat.peer.node_id_hex": "Peer node ID as hex (what your mesh uses as node ID).",
@@ -388,6 +394,77 @@ class ConfigEditorDialog(wx.Dialog):
 
         vs.Add(sync_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
 
+        # -----------------------
+        # Targeted sync (range-based) options
+        # -----------------------
+        targeted_label = wx.StaticText(panel, label="Targeted sync (range)")
+        targeted_label.SetToolTip(TOOLTIPS["chat.sync.targeted_sync"])
+        vs.Add(targeted_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 6)
+
+        targeted_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "")
+        targeted_box.GetStaticBox().SetToolTip(TOOLTIPS["chat.sync.targeted_sync"])
+
+        self.targeted_sync_enabled = wx.CheckBox(targeted_box.GetStaticBox(), label="Enable targeted sync")
+        self.targeted_sync_enabled.SetValue(bool(_deep_get(self.data, "chat.sync.targeted_sync.enabled", True)))
+        self.targeted_sync_enabled.SetToolTip(TOOLTIPS["chat.sync.targeted_sync.enabled"])
+        targeted_box.Add(self.targeted_sync_enabled, 0, wx.ALL, 6)
+
+        self.targeted_merge_distance = wx.SpinCtrl(
+            targeted_box.GetStaticBox(),
+            min=0,
+            max=1_000_000,
+            initial=int(_deep_get(self.data, "chat.sync.targeted_sync.merge_distance", 0)),
+        )
+        targeted_box.Add(
+            self._make_labeled(
+                targeted_box.GetStaticBox(),
+                "Merge distance (seqnos)",
+                self.targeted_merge_distance,
+                TOOLTIPS["chat.sync.targeted_sync.merge_distance"],
+            ),
+            0,
+            wx.EXPAND | wx.ALL,
+            6,
+        )
+
+        self.targeted_max_range_len = wx.SpinCtrl(
+            targeted_box.GetStaticBox(),
+            min=1,
+            max=1_000_000,
+            initial=int(_deep_get(self.data, "chat.sync.targeted_sync.max_range_len", 50)),
+        )
+        targeted_box.Add(
+            self._make_labeled(
+                targeted_box.GetStaticBox(),
+                "Max range length",
+                self.targeted_max_range_len,
+                TOOLTIPS["chat.sync.targeted_sync.max_range_len"],
+            ),
+            0,
+            wx.EXPAND | wx.ALL,
+            6,
+        )
+
+        self.targeted_max_requests = wx.SpinCtrl(
+            targeted_box.GetStaticBox(),
+            min=1,
+            max=1_000_000,
+            initial=int(_deep_get(self.data, "chat.sync.targeted_sync.max_requests_per_trigger", 3)),
+        )
+        targeted_box.Add(
+            self._make_labeled(
+                targeted_box.GetStaticBox(),
+                "Max requests per trigger",
+                self.targeted_max_requests,
+                TOOLTIPS["chat.sync.targeted_sync.max_requests_per_trigger"],
+            ),
+            0,
+            wx.EXPAND | wx.ALL,
+            6,
+        )
+
+        vs.Add(targeted_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+
         peers_label = wx.StaticText(panel, label="Peers")
         peers_label.SetToolTip(TOOLTIPS["chat.peers"])
         vs.Add(peers_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 6)
@@ -645,6 +722,16 @@ class ConfigEditorDialog(wx.Dialog):
         _deep_set(self.data, "chat.sync.max_send_per_response", int(self.sync_max_send.GetValue()))
         _deep_set(self.data, "chat.sync.auto_sync_on_new_peer", bool(self.sync_auto_on_new_peer.GetValue()))
         _deep_set(self.data, "chat.sync.min_sync_interval_seconds", int(self.sync_min_interval.GetValue()))
+
+        # chat.sync.targeted_sync
+        _deep_set(self.data, "chat.sync.targeted_sync.enabled", bool(self.targeted_sync_enabled.GetValue()))
+        _deep_set(self.data, "chat.sync.targeted_sync.merge_distance", int(self.targeted_merge_distance.GetValue()))
+        _deep_set(self.data, "chat.sync.targeted_sync.max_range_len", int(self.targeted_max_range_len.GetValue()))
+        _deep_set(
+            self.data,
+            "chat.sync.targeted_sync.max_requests_per_trigger",
+            int(self.targeted_max_requests.GetValue()),
+        )
 
         _deep_set(self.data, "chat.db_path", self.db_path.GetValue().strip())
 

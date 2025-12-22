@@ -74,6 +74,8 @@ Application-layer messages may also include sender-generated timestamps for disp
 
 ## 7. Deduplication and Forwarding
 
+To further reduce unnecessary retransmissions, the application layer may request only specific missing message ranges when gaps are detected. This targeted recovery mechanism reduces airtime usage and does not alter RF emission behavior.
+
 Each DATA frame is uniquely identified by (origin_id, sequence_number).  
 Duplicate packets are dropped to reduce channel congestion.
 

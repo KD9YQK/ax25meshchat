@@ -145,8 +145,6 @@ class MeshChatBackend(BackendInterface):
         self._discovered_node_ids: Dict[str, bytes] = {}
         # Per-peer/per-channel sync cooldown tracking
         self._last_sync_time: Dict[Tuple[str, str], float] = {}
-        # Per-origin/per-channel gap-triggered sync cooldown tracking
-        self._last_gap_sync_time: Dict[Tuple[bytes, str], float] = {}
         # Sync retry/backoff scheduler state
         self._sync_retry: Dict[Tuple[str, str], _SyncRetryState] = {}
         self._sync_retry_lock = threading.Lock()
@@ -163,7 +161,6 @@ class MeshChatBackend(BackendInterface):
             on_chat_message=self._on_chat_message,
             on_sync_applied=self._on_sync_applied,
             on_gap_report=self._on_gap_report,
-            on_gap_confirmed=self._on_gap_confirmed,
         )
 
         # Run MeshChatClient.start() in its own thread
@@ -319,60 +316,135 @@ class MeshChatBackend(BackendInterface):
         self._refresh_channels_from_db()
 
     def _on_gap_report(self, text: str) -> None:
-        """Callback from MeshChatClient when a gap report is generated."""
+        """Callback from MeshChatClient when a gap report is generated.
+
+        Policy:
+          - Only act on confirmed gaps (text contains " (confirmed)").
+          - Coalesce nearby/overlapping ranges into fewer requests.
+          - Chunk large ranges to keep requests bounded.
+          - Rate-limit to stay polite on RF.
+        """
         self._emit_status(text)
 
-    def _on_gap_confirmed(self, channel: str, origin_id: bytes, _report_line: str) -> None:
-        """Policy layer: decide when a confirmed gap should trigger a polite sync attempt.
+        # Example line:
+        #   KD9YQK-1 missing seq 142–147, 150 (confirmed)
+        if " (confirmed)" not in text:
+            return
 
-        Uses existing request_sync_last_n() primitive; no protocol changes.
-        """
+        marker = " missing seq "
+        idx = text.find(marker)
+        if idx <= 0:
+            return
+
+        callsign = text[:idx].strip()
+        if not callsign:
+            return
+
+        node_id = self._discovered_node_ids.get(callsign)
+        if node_id is None:
+            return
+
         cfg = self._config
-        if not getattr(cfg, "sync_enabled", True):
-            return
-        if not getattr(cfg, "gap_related_sync_enabled", True):
+        if not bool(getattr(cfg, "targeted_sync_enabled", True)):
             return
 
-        # Rate-limit: gap-related sync is intentionally slower than normal sync.
-        base_min = float(getattr(cfg, "sync_min_sync_interval_seconds", 30.0))
-        gap_min = float(getattr(cfg, "gap_related_min_interval_seconds", 120.0))
-        min_interval = gap_min if gap_min > base_min else base_min
+        # Parse ranges portion
+        ranges_part = text[idx + len(marker):]
+        paren_idx = ranges_part.find(" (")
+        if paren_idx >= 0:
+            ranges_part = ranges_part[:paren_idx]
+        ranges_part = ranges_part.strip()
+        if not ranges_part:
+            return
+
+        # Rate limit per-origin for gap-triggered requests
+        min_interval = float(getattr(cfg, "sync_min_sync_interval_seconds", 30.0))
+        if min_interval < 0.0:
+            min_interval = 0.0
 
         now = time.time()
-        key = (origin_id, channel)
-        last_ts = self._last_gap_sync_time.get(key)
+        key = (callsign, "__gap_range__")
+        last_ts = self._last_sync_time.get(key)
         if last_ts is not None and (now - last_ts) < min_interval:
             return
 
-        # Deterministic tiny jitter (no random import).
-        jitter_window = float(getattr(cfg, "gap_related_jitter_seconds", 2.0))
-        if jitter_window > 0.0:
-            jitter = (sum(origin_id) + len(channel)) % 1000
-            now = now + (jitter_window * (jitter / 1000.0))
+        # Convert "142–147, 150" into list of (start,end)
+        items = [p.strip() for p in ranges_part.split(",") if p.strip()]
+        parsed: List[Tuple[int, int]] = []
+        for part in items:
+            if "–" in part:
+                a, b = part.split("–", 1)
+            elif "-" in part:
+                a, b = part.split("-", 1)
+            else:
+                a, b = part, part
+            try:
+                s = int(a.strip())
+                e = int(b.strip())
+            except ValueError:
+                continue
+            if s < 0 or e < 0:
+                continue
+            if e < s:
+                s, e = e, s
+            parsed.append((s, e))
 
-        # Choose last_n: allow override, else use configured sync_last_n_messages.
-        override_last_n = int(getattr(cfg, "gap_related_last_n_messages", 0))
-        last_n = override_last_n if override_last_n > 0 else int(getattr(cfg, "sync_last_n_messages", 200))
+        if not parsed:
+            return
 
-        # Prefer syncing directly from the origin that exhibited the confirmed gap.
-        callsign = None
-        for cs, nid in self._discovered_node_ids.items():
-            if nid == origin_id:
-                callsign = cs
-                break
+        merge_distance = int(getattr(cfg, "targeted_sync_merge_distance", 0))
+        if merge_distance < 0:
+            merge_distance = 0
+
+        max_range_len = int(getattr(cfg, "targeted_sync_max_range_len", 50))
+        if max_range_len < 1:
+            max_range_len = 1
+
+        max_requests = int(getattr(cfg, "targeted_sync_max_requests_per_trigger", 3))
+        if max_requests < 1:
+            max_requests = 1
+
+        # --- Coalesce ranges ---
+        parsed.sort(key=lambda t: t[0])
+        merged: List[Tuple[int, int]] = []
+        cur_s, cur_e = parsed[0]
+        for s, e in parsed[1:]:
+            if s <= (cur_e + 1 + merge_distance):
+                if e > cur_e:
+                    cur_e = e
+            else:
+                merged.append((cur_s, cur_e))
+                cur_s, cur_e = s, e
+        merged.append((cur_s, cur_e))
+
+        # --- Chunk merged ranges to bounded requests ---
+        chunks: List[Tuple[int, int]] = []
+        for s, e in merged:
+            if (e - s + 1) <= max_range_len:
+                chunks.append((s, e))
+                continue
+            cur = s
+            while cur <= e:
+                end = cur + max_range_len - 1
+                if end > e:
+                    end = e
+                chunks.append((cur, end))
+                cur = end + 1
+
+        chunks = chunks[:max_requests]
 
         try:
-            if callsign is not None:
-                self._client.request_sync_last_n(dest_node_id=origin_id, channel=channel, last_n=last_n)
-                self._last_gap_sync_time[key] = now
-                self._emit_status(f"Gap-related sync requested for {channel} from {callsign}")
-            else:
-                # Fallback: use existing channel sync behavior (default peer / DM semantics).
-                self.request_sync_for_channel(channel)
-                self._last_gap_sync_time[key] = now
-                self._emit_status(f"Gap-related sync requested for {channel} (fallback)")
+            for s, e in chunks:
+                self._client.request_sync_range(
+                    dest_node_id=node_id,
+                    channel="#general",
+                    origin_id=node_id,
+                    start_seqno=s,
+                    end_seqno=e,
+                )
+            self._last_sync_time[key] = now
         except (OSError, ValueError, ArdopLinkError) as exc:
-            self._emit_status(f"Gap-related sync request failed for {channel}: {exc}")
+            self._emit_status(f"Targeted sync request failed for {callsign}: {exc}")
 
     def _status_loop(self) -> None:
         while self._running:

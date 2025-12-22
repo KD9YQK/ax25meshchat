@@ -22,4 +22,8 @@ No. Operators configure and control all nodes and timing parameters.
 
 ## Does this comply with Part 97 intent?
 
-Yes. The protocol emphasizes transparency, shared-spectrum respect, and experimental use consistent with amateur radio principles.
+Yes.
+
+## Does targeted synchronization change protocol behavior?
+
+No. Targeted synchronization is an application-layer efficiency feature that requests only specific missing message ranges. It does not alter framing, routing, station identification, duty cycle requirements, or emission characteristics. The protocol emphasizes transparency, shared-spectrum respect, and experimental use consistent with amateur radio principles.

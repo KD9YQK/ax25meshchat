@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import binascii
+import json
 import random
 import heapq
 import socket
@@ -122,12 +123,49 @@ def _try_decode_sync_request(mesh_payload: bytes) -> Optional[str]:
 
     req = parse_sync_request_any(chat_msg)
     if req is None:
-        return None
+        # The test harness may be newer/older than the runtime protocol helpers.
+        # Best-effort: try to interpret text JSON directly for newer modes.
+        try:
+            obj = json.loads(chat_msg.text)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(obj, dict):
+            return None
+        if obj.get("mode") != "range":
+            return None
+        origin_id_hex = obj.get("origin_id_hex")
+        start = obj.get("start")
+        end = obj.get("end")
+        if not isinstance(origin_id_hex, str) or not isinstance(start, int) or not isinstance(end, int):
+            return None
+        return (
+            f"SYNC_REQUEST(range) origin={origin} dest={dest} channel={chat_msg.channel!r} nick={chat_msg.nick!r} "
+            f"target_origin={origin_id_hex} seq={start}-{end}"
+        )
 
     if req.mode == "since_ts":
         return (
             f"SYNC_REQUEST(v1 since_ts) origin={origin} dest={dest} channel={chat_msg.channel!r} "
             f"nick={chat_msg.nick!r} since_ts={req.since_ts}"
+        )
+
+    if req.mode == "range":
+        # If parse_sync_request_any supports it, display the mode cleanly.
+        # (Current codebase may decode it directly into SyncRequest, or not.)
+        try:
+            obj = json.loads(chat_msg.text)
+        except json.JSONDecodeError:
+            obj = {}
+        origin_id_hex = obj.get("origin_id_hex") if isinstance(obj, dict) else None
+        start = obj.get("start") if isinstance(obj, dict) else None
+        end = obj.get("end") if isinstance(obj, dict) else None
+        if isinstance(origin_id_hex, str) and isinstance(start, int) and isinstance(end, int):
+            return (
+                f"SYNC_REQUEST(range) origin={origin} dest={dest} channel={chat_msg.channel!r} nick={chat_msg.nick!r} "
+                f"target_origin={origin_id_hex} seq={start}-{end}"
+            )
+        return (
+            f"SYNC_REQUEST(range) origin={origin} dest={dest} channel={chat_msg.channel!r} nick={chat_msg.nick!r}"
         )
 
     inv_items = sorted(req.inv.items())
@@ -519,6 +557,8 @@ class FakeArdopServer:
                 # Command mode: keep hex injection behavior, but support a few helpers.
                 # - burst <origin> <dest> <channel> <count> <text...>
                 #   Sends <count> CHAT_TYPE_MESSAGE frames with incrementing seqnos.
+                # - sync_range <origin> <dest> <channel> <target_origin> <start> <end>
+                #   Sends a CHAT_TYPE_SYNC_REQUEST with text JSON {"mode":"range",...}
                 if line.startswith('burst '):
                     parts = line.split(' ', 5)
                     if len(parts) < 6:
@@ -555,6 +595,64 @@ class FakeArdopServer:
                     inject_seqnos[origin8] = seqno
                     print(f"[fake_ardopc] BURST sent {count} msg(s) origin={origin} dest={dest} channel={channel}")
                     continue
+
+                if line.startswith('sync_range '):
+                    parts = line.split(' ')
+                    if len(parts) != 7:
+                        print('[fake_ardopc] usage: sync_range <origin> <dest> <channel> <target_origin> <start> <end>')
+                        continue
+                    _, origin, dest, channel, target_origin_s, start_s, end_s = parts
+                    try:
+                        start = int(start_s)
+                        end = int(end_s)
+                    except ValueError:
+                        print('[fake_ardopc] invalid start/end')
+                        continue
+                    if start < 0 or end < 0 or end < start:
+                        print('[fake_ardopc] invalid range')
+                        continue
+
+                    # target_origin may be provided as 16-hex or as an ASCII node id.
+                    target_origin_s = target_origin_s.strip()
+                    target_hex: Optional[str] = None
+                    if len(target_origin_s) == 16:
+                        try:
+                            _ = binascii.unhexlify(target_origin_s)
+                            target_hex = target_origin_s.lower()
+                        except (binascii.Error, ValueError):
+                            target_hex = None
+                    if target_hex is None:
+                        target_hex = binascii.hexlify(_ascii8(target_origin_s)).decode('ascii')
+
+                    payload = {
+                        "mode": "range",
+                        "origin_id_hex": target_hex,
+                        "start": start,
+                        "end": end,
+                    }
+                    msg = ChatMessage(
+                        msg_type=CHAT_TYPE_SYNC_REQUEST,
+                        channel=channel,
+                        nick=origin,
+                        text=json.dumps(payload),
+                        created_ts=int(time.time()),
+                    )
+                    app = encode_chat_message(msg)
+
+                    if not hasattr(self, '_inject_seqnos'):
+                        setattr(self, '_inject_seqnos', {})
+                    inject_seqnos = getattr(self, '_inject_seqnos')
+                    origin8 = _ascii8(origin)
+                    seqno = inject_seqnos.get(origin8, 1)
+
+                    mesh = build_fake_data(origin=origin, dest=dest, seqno=seqno, ttl=5, app_payload=app, compress=True)
+                    self.send_to_all(mesh)
+                    inject_seqnos[origin8] = (seqno + 1) & 0xFFFFFFFF
+                    print(
+                        f"[fake_ardopc] SYNC_RANGE sent origin={origin} dest={dest} channel={channel} target={target_hex} seq={start}-{end}"
+                    )
+                    continue
+
                 if not line:
                     continue
                 try:
