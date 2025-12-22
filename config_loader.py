@@ -22,6 +22,70 @@ from mesh_config import (
 from chat_client import MeshChatConfig, ChatPeer  # if you're using chat
 
 
+# ---------------------------------------------------------------------------
+# GUI theme config (raw YAML passthrough)
+# ---------------------------------------------------------------------------
+
+
+def load_gui_theme_from_yaml(path: str) -> Dict[str, Any]:
+    """Load the optional top-level `gui` section from YAML.
+
+    This is intentionally kept as a raw dict so the GUI can evolve
+    without forcing backend config structs to change.
+    """
+
+    with open(path, "r", encoding="utf-8") as f:
+        root = yaml.safe_load(f)
+
+    if not isinstance(root, dict):
+        return {}
+
+    gui_any = root.get("gui", {})
+    if not isinstance(gui_any, dict):
+        return {}
+
+    return gui_any
+
+
+def load_gui_identity_from_yaml(path: str) -> Dict[str, Any]:
+    """Load a small identity snapshot for GUI-only use.
+
+    Returns a dict with:
+      - callsign: str
+      - peer_nicks: list[str]
+      - peer_keys: list[str]
+
+    This avoids importing YAML directly in the GUI module.
+    """
+
+    with open(path, "r", encoding="utf-8") as f:
+        root = yaml.safe_load(f)
+
+    if not isinstance(root, dict):
+        return {"callsign": "", "peer_nicks": [], "peer_keys": []}
+
+    callsign = ""
+    mesh_any = root.get("mesh", {})
+    if isinstance(mesh_any, dict):
+        callsign = str(mesh_any.get("callsign", "") or "")
+
+    peer_nicks: list[str] = []
+    peer_keys: list[str] = []
+
+    chat_any = root.get("chat", {})
+    if isinstance(chat_any, dict):
+        peers_any = chat_any.get("peers", {})
+        if isinstance(peers_any, dict):
+            for key, val_any in peers_any.items():
+                peer_keys.append(str(key))
+                if isinstance(val_any, dict):
+                    nick = val_any.get("nick")
+                    if nick:
+                        peer_nicks.append(str(nick))
+
+    return {"callsign": callsign, "peer_nicks": peer_nicks, "peer_keys": peer_keys}
+
+
 def _get_required(mapping: Dict[str, Any], key: str) -> Any:
     if key not in mapping:
         raise KeyError(f"Missing required config key: {key}")

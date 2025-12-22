@@ -28,6 +28,8 @@ from typing import Optional
 import wx
 import wx.aui as aui
 
+from config_loader import load_gui_theme_from_yaml, load_gui_identity_from_yaml
+
 from mesh_backend import (
     BackendInterface,
     ChatEvent,
@@ -48,6 +50,15 @@ class ChatFrame(wx.Frame):
         self.backend = backend
         self.ui_queue: queue.Queue[UIEvent] = backend.get_ui_queue()
         self._config_path: str = str(config_path)
+
+        # GUI theme + identity (loaded from config.yaml). Safe defaults if absent.
+        self._gui_theme: dict[str, object] = {}
+        self._callsign: str = ""
+        self._peer_nicks: set[str] = set()
+        self._peer_keys: set[str] = set()
+        self._theme_colors: dict[str, Optional[wx.Colour]] = {}
+        self._theme_font_sizes: dict[str, int] = {}
+        self._load_gui_preferences()
 
         self._status_tab_name = "Status"
         self._known_nodes: list[str] = []
@@ -162,8 +173,14 @@ class ChatFrame(wx.Frame):
 
         self.SetSizer(main_sizer)
 
+        # Apply theme after widgets exist.
+        self._apply_gui_theme()
+
         # Create initial Status tab (select it at startup)
         self._ensure_tab(self._status_tab_name, select=True)
+
+        # Apply configured colors/fonts (if any)
+        self._apply_gui_theme()
 
     # -----------------------------------------------------------------
     # Tab helpers
@@ -180,6 +197,7 @@ class ChatFrame(wx.Frame):
         sizer = wx.BoxSizer(wx.VERTICAL)
 
         text_ctrl = wx.TextCtrl(panel, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_RICH2)
+        self._apply_theme_to_chat_ctrl(text_ctrl)
         sizer.Add(text_ctrl, 1, wx.EXPAND)
 
         panel.SetSizer(sizer)
@@ -203,12 +221,63 @@ class ChatFrame(wx.Frame):
         return None
 
     def _append_to_tab(self, name: str, text: str) -> None:
+        """Append plain (un-styled) text to a tab."""
         self._ensure_tab(name, select=False)
         ctrl = self._get_text_ctrl_for_tab(name)
         if ctrl is None:
             return
         ctrl.SetInsertionPointEnd()
         ctrl.WriteText(text)
+
+    def _chat_text_attr(self, *, fg: Optional[wx.Colour] = None, bold: bool = False) -> wx.TextAttr:
+        chat_fg = self._theme_colors.get("chat_fg")
+        chat_bg = self._theme_colors.get("chat_bg")
+
+        font = wx.SystemSettings.GetFont(wx.SYS_DEFAULT_GUI_FONT)
+        font.SetPointSize(self._theme_font_sizes.get("chat", font.GetPointSize()))
+        if bold:
+            font.SetWeight(wx.FONTWEIGHT_BOLD)
+
+        use_fg = fg if fg is not None else chat_fg
+        use_bg = chat_bg
+
+        if use_fg is None:
+            fg_out = wx.NullColour
+        else:
+            fg_out = use_fg
+        if use_bg is None:
+            bg_out = wx.NullColour
+        else:
+            bg_out = use_bg
+        return wx.TextAttr(fg_out, bg_out, font)
+
+    def _append_styled_parts(self, name: str, parts: list[tuple[str, wx.TextAttr]]) -> None:
+        self._ensure_tab(name, select=False)
+        ctrl = self._get_text_ctrl_for_tab(name)
+        if ctrl is None:
+            return
+        ctrl.SetInsertionPointEnd()
+        for text, attr in parts:
+            ctrl.SetDefaultStyle(attr)
+            ctrl.WriteText(text)
+        # Reset to default style for future appends.
+        ctrl.SetDefaultStyle(self._chat_text_attr())
+
+    def _append_chat_line(self, tab: str, ts_str: str, nick: str, text: str, *, category: str) -> None:
+        """Append a single chat line, highlighting the sender portion."""
+
+        highlight = self._theme_colors.get(category)
+        normal_attr = self._chat_text_attr()
+        nick_attr = self._chat_text_attr(fg=highlight, bold=True)
+
+        self._append_styled_parts(
+            tab,
+            parts=[
+                (f"[{ts_str}] ", normal_attr),
+                (f"<{nick}>", nick_attr),
+                (f" {text}\n", normal_attr),
+            ],
+        )
 
     def _get_current_tab_name(self) -> str:
         idx = self.notebook.GetSelection()
@@ -250,7 +319,7 @@ class ChatFrame(wx.Frame):
             tab_name = "#general"
 
         ts_str = time.strftime("%H:%M:%S", time.localtime())
-        self._append_to_tab(tab_name, f"[{ts_str}] <me> {text}\n")
+        self._append_chat_line(tab_name, ts_str, "me", text, category="me")
 
         self.input_box.SetValue("")
         self.backend.send_message(tab_name, text)
@@ -351,7 +420,8 @@ class ChatFrame(wx.Frame):
 
     def _render_chat_event(self, ev: ChatEvent) -> None:
         ts_str = time.strftime("%H:%M:%S", time.localtime(ev.timestamp))
-        self._append_to_tab(ev.channel, f"[{ts_str}] <{ev.nick}> {ev.text}\n")
+        category = self._categorize_sender(ev.nick)
+        self._append_chat_line(ev.channel, ts_str, ev.nick, ev.text, category=category)
 
     def _render_status_event(self, ev: StatusEvent) -> None:
         self.SetStatusText(ev.text, 0)
@@ -378,7 +448,149 @@ class ChatFrame(wx.Frame):
 
         for (origin_id, seqno, channel, nick, text, ts) in ev.messages:
             ts_str = time.strftime("%H:%M:%S", time.localtime(ts))
-            self._append_to_tab(channel, f"[{ts_str}] <{nick}> {text}\n")
+            category = self._categorize_sender(nick)
+            self._append_chat_line(channel, ts_str, nick, text, category=category)
+
+    # -----------------------------------------------------------------
+    # Theme + sender categorization
+    # -----------------------------------------------------------------
+
+    def _load_gui_preferences(self) -> None:
+        try:
+            self._gui_theme = load_gui_theme_from_yaml(self._config_path)
+        except (OSError, ValueError):
+            self._gui_theme = {}
+
+        try:
+            ident = load_gui_identity_from_yaml(self._config_path)
+        except (OSError, ValueError):
+            ident = {"callsign": "", "peer_nicks": [], "peer_keys": []}
+
+        self._callsign = str(ident.get("callsign", "") or "")
+        self._peer_nicks = set(str(x) for x in (ident.get("peer_nicks", []) or []))
+        self._peer_keys = set(str(x) for x in (ident.get("peer_keys", []) or []))
+
+        self._theme_colors = self._parse_theme_colors(self._gui_theme.get("colors"))
+        self._theme_font_sizes = self._parse_theme_font_sizes(self._gui_theme.get("font_sizes"))
+
+    @staticmethod
+    def _parse_theme_colors(colors_any: object) -> dict[str, Optional[wx.Colour]]:
+        def _to_colour(v: object) -> Optional[wx.Colour]:
+            if not isinstance(v, str):
+                return None
+            raw = v.strip()
+            if not raw:
+                return None
+            if raw.startswith("#") and len(raw) == 7:
+                try:
+                    r = int(raw[1:3], 16)
+                    g = int(raw[3:5], 16)
+                    b = int(raw[5:7], 16)
+                except ValueError:
+                    return None
+                return wx.Colour(r, g, b)
+            return None
+
+        colors: dict[str, Optional[wx.Colour]] = {
+            "window_bg": None,
+            "chat_bg": None,
+            "chat_fg": None,
+            "input_bg": None,
+            "input_fg": None,
+            "list_bg": None,
+            "list_fg": None,
+            "status_bg": None,
+            "status_fg": None,
+            "me": None,
+            "known": None,
+            "unknown": None,
+        }
+
+        if not isinstance(colors_any, dict):
+            return colors
+
+        for k in list(colors.keys()):
+            colors[k] = _to_colour(colors_any.get(k))
+
+        return colors
+
+    @staticmethod
+    def _parse_theme_font_sizes(fonts_any: object) -> dict[str, int]:
+        sizes = {
+            "chat": 10,
+            "input": 10,
+            "list": 10,
+            "status": 10,
+        }
+        if not isinstance(fonts_any, dict):
+            return sizes
+        for k in list(sizes.keys()):
+            val = fonts_any.get(k)
+            if isinstance(val, int) and 6 <= val <= 48:
+                sizes[k] = val
+        return sizes
+
+    def _categorize_sender(self, nick: str) -> str:
+        n = nick.strip()
+        if not n:
+            return "unknown"
+        if n == "me" or (self._callsign and n == self._callsign):
+            return "me"
+        if n in self._peer_nicks or n in self._peer_keys:
+            return "known"
+        if n in self._known_nodes:
+            return "known"
+        return "unknown"
+
+    def _apply_gui_theme(self) -> None:
+        # Window/panels
+        window_bg = self._theme_colors.get("window_bg")
+        if window_bg is not None:
+            self.SetBackgroundColour(window_bg)
+
+        # Left list
+        list_bg = self._theme_colors.get("list_bg")
+        list_fg = self._theme_colors.get("list_fg")
+        if list_bg is not None:
+            self.node_list.SetBackgroundColour(list_bg)
+        if list_fg is not None:
+            self.node_list.SetForegroundColour(list_fg)
+        self._apply_font_size(self.node_list, self._theme_font_sizes.get("list", 10))
+
+        # Input
+        input_bg = self._theme_colors.get("input_bg")
+        input_fg = self._theme_colors.get("input_fg")
+        if input_bg is not None:
+            self.input_box.SetBackgroundColour(input_bg)
+        if input_fg is not None:
+            self.input_box.SetForegroundColour(input_fg)
+        self._apply_font_size(self.input_box, self._theme_font_sizes.get("input", 10))
+        self._apply_font_size(self.send_button, self._theme_font_sizes.get("input", 10))
+
+        # Existing tabs
+        for idx in range(self.notebook.GetPageCount()):
+            name = self.notebook.GetPageText(idx)
+            ctrl = self._get_text_ctrl_for_tab(name)
+            if ctrl is not None:
+                self._apply_theme_to_chat_ctrl(ctrl)
+
+        self.Refresh()
+
+    def _apply_theme_to_chat_ctrl(self, ctrl: wx.TextCtrl) -> None:
+        chat_bg = self._theme_colors.get("chat_bg")
+        chat_fg = self._theme_colors.get("chat_fg")
+        if chat_bg is not None:
+            ctrl.SetBackgroundColour(chat_bg)
+        if chat_fg is not None:
+            ctrl.SetForegroundColour(chat_fg)
+        self._apply_font_size(ctrl, self._theme_font_sizes.get("chat", 10))
+
+    @staticmethod
+    def _apply_font_size(win: wx.Window, point_size: int) -> None:
+        font = win.GetFont()
+        if font.IsOk():
+            font.SetPointSize(point_size)
+            win.SetFont(font)
 
     def _rebuild_left_list(self) -> None:
         selected = None

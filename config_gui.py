@@ -21,9 +21,9 @@ import wx
 
 try:
     import yaml  # type: ignore
-except Exception as exc:  # pragma: no cover
+except ImportError as exc:  # pragma: no cover
     raise RuntimeError(
-        "PyYAML is required for gui_config.py (pip install pyyaml)."
+        "PyYAML is required for config_gui.py (pip install pyyaml)."
     ) from exc
 
 # -----------------------------
@@ -61,6 +61,27 @@ TOOLTIPS: Dict[str, str] = {
     "chat.peer_key": "Local alias for the peer (used in config file; not transmitted).",
     "chat.peer.node_id_hex": "Peer node ID as hex (what your mesh uses as node ID).",
     "chat.peer.nick": "Display nickname for that peer (used in UI/history).",
+
+    "gui": "GUI appearance settings (colors and font sizes).",
+    "gui.colors": "Hex colors for GUI elements (e.g., '#1e1e1e').",
+    "gui.colors.window_bg": "Background color for the main window and panels.",
+    "gui.colors.chat_bg": "Chat transcript background color.",
+    "gui.colors.chat_fg": "Chat transcript foreground/text color.",
+    "gui.colors.input_bg": "Input textbox background color.",
+    "gui.colors.input_fg": "Input textbox foreground/text color.",
+    "gui.colors.list_bg": "Left list (nodes/channels) background color.",
+    "gui.colors.list_fg": "Left list (nodes/channels) foreground/text color.",
+    "gui.colors.status_bg": "Status bar background color.",
+    "gui.colors.status_fg": "Status bar foreground/text color.",
+    "gui.colors.me": "Color used to highlight your own callsign/nick in chat.",
+    "gui.colors.known": "Color used to highlight known peers in chat.",
+    "gui.colors.unknown": "Color used to highlight unknown senders in chat.",
+
+    "gui.font_sizes": "Font sizes (points) used by different GUI elements.",
+    "gui.font_sizes.chat": "Font size for chat transcript.",
+    "gui.font_sizes.input": "Font size for the message input textbox.",
+    "gui.font_sizes.list": "Font size for the nodes/channels list.",
+    "gui.font_sizes.status": "Font size for the status bar.",
 }
 
 
@@ -198,6 +219,7 @@ class ConfigEditorDialog(wx.Dialog):
         self._build_routing_tab()
         self._build_security_tab()
         self._build_chat_tab()
+        self._build_gui_tab()
 
         hint = wx.StaticText(
             self,
@@ -399,6 +421,87 @@ class ConfigEditorDialog(wx.Dialog):
         panel.SetSizer(vs)
         self.nb.AddPage(panel, "Chat")
 
+    @staticmethod
+    def _color_ctrl(parent: wx.Window, value: Any) -> wx.ColourPickerCtrl:
+        # Accept #RRGGBB strings; fall back to default control color.
+        raw = str(value) if value is not None else ""
+        col = wx.NullColour
+        if raw.startswith("#") and len(raw) == 7:
+            try:
+                col = wx.Colour(raw)
+            except (ValueError, TypeError):
+                col = wx.NullColour
+        return wx.ColourPickerCtrl(parent, colour=col)
+
+    @staticmethod
+    def _color_to_hex(col: wx.Colour) -> str:
+        return f"#{col.Red():02x}{col.Green():02x}{col.Blue():02x}"
+
+    def _build_gui_tab(self) -> None:
+        panel = wx.Panel(self.nb)
+        vs = wx.BoxSizer(wx.VERTICAL)
+
+        colors_label = wx.StaticText(panel, label="Colors")
+        colors_label.SetToolTip(TOOLTIPS["gui.colors"])
+        vs.Add(colors_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 6)
+
+        colors_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "")
+        colors_box.GetStaticBox().SetToolTip(TOOLTIPS["gui.colors"])
+
+        self.gui_window_bg = self._color_ctrl(panel, _deep_get(self.data, "gui.colors.window_bg", None))
+        colors_box.Add(self._make_labeled(panel, "Window background", self.gui_window_bg, TOOLTIPS["gui.colors.window_bg"]), 0, wx.EXPAND | wx.ALL, 6)
+
+        self.gui_chat_bg = self._color_ctrl(panel, _deep_get(self.data, "gui.colors.chat_bg", None))
+        colors_box.Add(self._make_labeled(panel, "Chat background", self.gui_chat_bg, TOOLTIPS["gui.colors.chat_bg"]), 0, wx.EXPAND | wx.ALL, 6)
+
+        self.gui_chat_fg = self._color_ctrl(panel, _deep_get(self.data, "gui.colors.chat_fg", None))
+        colors_box.Add(self._make_labeled(panel, "Chat text", self.gui_chat_fg, TOOLTIPS["gui.colors.chat_fg"]), 0, wx.EXPAND | wx.ALL, 6)
+
+        self.gui_input_bg = self._color_ctrl(panel, _deep_get(self.data, "gui.colors.input_bg", None))
+        colors_box.Add(self._make_labeled(panel, "Input background", self.gui_input_bg, TOOLTIPS["gui.colors.input_bg"]), 0, wx.EXPAND | wx.ALL, 6)
+
+        self.gui_input_fg = self._color_ctrl(panel, _deep_get(self.data, "gui.colors.input_fg", None))
+        colors_box.Add(self._make_labeled(panel, "Input text", self.gui_input_fg, TOOLTIPS["gui.colors.input_fg"]), 0, wx.EXPAND | wx.ALL, 6)
+
+        self.gui_list_bg = self._color_ctrl(panel, _deep_get(self.data, "gui.colors.list_bg", None))
+        colors_box.Add(self._make_labeled(panel, "List background", self.gui_list_bg, TOOLTIPS["gui.colors.list_bg"]), 0, wx.EXPAND | wx.ALL, 6)
+
+        self.gui_list_fg = self._color_ctrl(panel, _deep_get(self.data, "gui.colors.list_fg", None))
+        colors_box.Add(self._make_labeled(panel, "List text", self.gui_list_fg, TOOLTIPS["gui.colors.list_fg"]), 0, wx.EXPAND | wx.ALL, 6)
+
+        # Sender highlight colors
+        self.gui_me = self._color_ctrl(panel, _deep_get(self.data, "gui.colors.me", None))
+        colors_box.Add(self._make_labeled(panel, "Highlight: me", self.gui_me, TOOLTIPS["gui.colors.me"]), 0, wx.EXPAND | wx.ALL, 6)
+
+        self.gui_known = self._color_ctrl(panel, _deep_get(self.data, "gui.colors.known", None))
+        colors_box.Add(self._make_labeled(panel, "Highlight: known", self.gui_known, TOOLTIPS["gui.colors.known"]), 0, wx.EXPAND | wx.ALL, 6)
+
+        self.gui_unknown = self._color_ctrl(panel, _deep_get(self.data, "gui.colors.unknown", None))
+        colors_box.Add(self._make_labeled(panel, "Highlight: unknown", self.gui_unknown, TOOLTIPS["gui.colors.unknown"]), 0, wx.EXPAND | wx.ALL, 6)
+
+        vs.Add(colors_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+
+        fonts_label = wx.StaticText(panel, label="Font sizes")
+        fonts_label.SetToolTip(TOOLTIPS["gui.font_sizes"])
+        vs.Add(fonts_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 6)
+
+        fonts_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "")
+        fonts_box.GetStaticBox().SetToolTip(TOOLTIPS["gui.font_sizes"])
+
+        self.gui_font_chat = wx.SpinCtrl(panel, min=6, max=48, initial=int(_deep_get(self.data, "gui.font_sizes.chat", 10)))
+        fonts_box.Add(self._make_labeled(panel, "Chat", self.gui_font_chat, TOOLTIPS["gui.font_sizes.chat"]), 0, wx.EXPAND | wx.ALL, 6)
+
+        self.gui_font_input = wx.SpinCtrl(panel, min=6, max=48, initial=int(_deep_get(self.data, "gui.font_sizes.input", 10)))
+        fonts_box.Add(self._make_labeled(panel, "Input", self.gui_font_input, TOOLTIPS["gui.font_sizes.input"]), 0, wx.EXPAND | wx.ALL, 6)
+
+        self.gui_font_list = wx.SpinCtrl(panel, min=6, max=48, initial=int(_deep_get(self.data, "gui.font_sizes.list", 10)))
+        fonts_box.Add(self._make_labeled(panel, "List", self.gui_font_list, TOOLTIPS["gui.font_sizes.list"]), 0, wx.EXPAND | wx.ALL, 6)
+
+        vs.Add(fonts_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+
+        panel.SetSizer(vs)
+        self.nb.AddPage(panel, "GUI")
+
     def _load_peers_into_list(self) -> None:
         self.peers_list.DeleteAllItems()
         peers = _deep_get(self.data, "chat.peers", {}) or {}
@@ -545,9 +648,25 @@ class ConfigEditorDialog(wx.Dialog):
 
         _deep_set(self.data, "chat.db_path", self.db_path.GetValue().strip())
 
+        # gui theme
+        _deep_set(self.data, "gui.colors.window_bg", self._color_to_hex(self.gui_window_bg.GetColour()))
+        _deep_set(self.data, "gui.colors.chat_bg", self._color_to_hex(self.gui_chat_bg.GetColour()))
+        _deep_set(self.data, "gui.colors.chat_fg", self._color_to_hex(self.gui_chat_fg.GetColour()))
+        _deep_set(self.data, "gui.colors.input_bg", self._color_to_hex(self.gui_input_bg.GetColour()))
+        _deep_set(self.data, "gui.colors.input_fg", self._color_to_hex(self.gui_input_fg.GetColour()))
+        _deep_set(self.data, "gui.colors.list_bg", self._color_to_hex(self.gui_list_bg.GetColour()))
+        _deep_set(self.data, "gui.colors.list_fg", self._color_to_hex(self.gui_list_fg.GetColour()))
+        _deep_set(self.data, "gui.colors.me", self._color_to_hex(self.gui_me.GetColour()))
+        _deep_set(self.data, "gui.colors.known", self._color_to_hex(self.gui_known.GetColour()))
+        _deep_set(self.data, "gui.colors.unknown", self._color_to_hex(self.gui_unknown.GetColour()))
+
+        _deep_set(self.data, "gui.font_sizes.chat", int(self.gui_font_chat.GetValue()))
+        _deep_set(self.data, "gui.font_sizes.input", int(self.gui_font_input.GetValue()))
+        _deep_set(self.data, "gui.font_sizes.list", int(self.gui_font_list.GetValue()))
+
         try:
             save_config_yaml(self.config_path, self.data)
-        except Exception as e:
+        except (OSError, ValueError, yaml.YAMLError) as e:
             wx.MessageBox(f"Failed to save config:\n{e}", "Error", wx.ICON_ERROR)
             return
 

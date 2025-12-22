@@ -83,16 +83,15 @@ class ChatStore:
 
         Notes on ordering:
         - Messages may arrive out-of-order (testing, jitter, retries).
-        - We slice by insert order (SQLite row id) to get the *most recent* N rows,
-          then sort within that slice by (origin_id, seqno) so per-sender ordering
-          is stable and deterministic.
+        - For display in a single combined timeline, we order primarily by timestamp (ts)
+          and use SQLite row id as a stable tiebreaker.
         """
         if limit <= 0:
             sql_all = """
             SELECT origin_id, seqno, channel, nick, text, ts
             FROM chat_messages
             WHERE channel = ?
-            ORDER BY origin_id ASC, seqno ASC, ts ASC;
+            ORDER BY ts ASC, id ASC;
             """
             cur = self._conn.execute(sql_all, (channel,))
             return cur.fetchall()
@@ -108,7 +107,7 @@ class ChatStore:
         rows = cur.fetchall()
 
         # rows: (id, origin_id, seqno, channel, nick, text, ts)
-        rows.sort(key=lambda r: (r[1], r[2], r[0]))
+        rows.sort(key=lambda r: (r[6], r[1], r[2], r[0]))
         return [(r[1], r[2], r[3], r[4], r[5], r[6]) for r in rows]
 
     def get_messages_since(

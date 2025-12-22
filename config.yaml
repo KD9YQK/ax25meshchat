@@ -1,39 +1,49 @@
 mesh:
-  callsign: "KD9YQK-1"
-  mesh_dest_callsign: "QMESH-0"
-
+  callsign: KD9YQK-1
+  mesh_dest_callsign: QMESH-0
 ardop:
-  host: "127.0.0.1"
+  host: 127.0.0.1
   port: 8515
   reconnect_base_delay: 5.0
   reconnect_max_delay: 60.0
   tx_queue_size: 1000
-
 routing:
-  # One OGM every 10 minutes
   ogm_interval_seconds: 600.0
   ogm_ttl: 5
   route_expiry_seconds: 1200.0
   neighbor_expiry_seconds: 610.0
   data_seen_expiry_seconds: 610.0
-
 security:
-  # MUST remain false for anything on ham bands
   enable_encryption: false
   key_hex: null
-
 chat:
-  db_path: "chat_logs.sqlite"
+  db_path: chat_logs.sqlite
   sync:
     enabled: true
-    last_n_messages: 200          # window size per channel/DM
-    max_send_per_response: 200    # cap to avoid huge bursts
-    auto_sync_on_new_peer: true   # when a new node appears
-    min_sync_interval_seconds: 30 # per-peer/per-channel cooldown
+    last_n_messages: 200
+    max_send_per_response: 200
+    auto_sync_on_new_peer: true
+    min_sync_interval_seconds: 30
   peers:
     bob:
-      node_id_hex: "0011223344556677"
-      nick: "Bob"
+      node_id_hex: '0011223344556677'
+      nick: Bob
     alice:
-      node_id_hex: "1122334455667788"
-      nick: "Alice"
+      node_id_hex: '1122334455667788'
+      nick: Alice
+gui:
+  colors:
+    window_bg: '#1e1e1e'
+    chat_bg: '#111111'
+    chat_fg: '#e6e6e6'
+    input_bg: '#222222'
+    input_fg: '#e6e6e6'
+    list_bg: '#1a1a1a'
+    list_fg: '#e6e6e6'
+    me: '#4fc3f7'
+    known: '#a5d6a7'
+    unknown: '#ffcc80'
+  font_sizes:
+    chat: 10
+    input: 10
+    list: 14
