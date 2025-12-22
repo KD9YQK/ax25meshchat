@@ -6,6 +6,8 @@ This project implements an experimental amateur radio mesh networking protocol d
 
 The protocol supports low-bandwidth digital messaging over shared RF spectrum using conservative duty cycles and publicly documented formats.
 
+Chat messages include a sender-generated UTC creation timestamp used solely for human-readable display and deterministic history ordering; this metadata does not influence routing, transmission timing, or RF behavior.
+
 ## Key Compliance Points
 
 - No encryption is used during amateur radio operation

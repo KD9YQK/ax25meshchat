@@ -3,8 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
 import json
+import struct
+import time
 
-CHAT_VERSION = 1
+# Protocol version:
+# - v1: [ver][type][chan_len][nick_len][chan][nick][text]
+# - v2: [ver][type][chan_len][nick_len][created_ts_u32][chan][nick][text]
+CHAT_VERSION = 2
 
 CHAT_TYPE_MESSAGE = 1
 CHAT_TYPE_SYNC_REQUEST = 5
@@ -17,11 +22,16 @@ class ChatMessage:
     channel: str
     nick: str
     text: str
+    # Unix UTC seconds when the message was created (sender-side).
+    created_ts: int
 
 
 def encode_chat_message(msg: ChatMessage) -> bytes:
     """
-    Basic chat message encoder: [ver][type][chan_len][nick_len][chan][nick][text]
+    Encode a chat message.
+
+    v1: [ver][type][chan_len][nick_len][chan][nick][text]
+    v2: [ver][type][chan_len][nick_len][created_ts_u32][chan][nick][text]
     """
     channel_bytes = msg.channel.encode("utf-8")
     nick_bytes = msg.nick.encode("utf-8")
@@ -41,7 +51,12 @@ def encode_chat_message(msg: ChatMessage) -> bytes:
     header[2] = chan_len
     header[3] = nick_len
 
-    return bytes(header) + channel_bytes + nick_bytes + text_bytes
+    created_ts = int(msg.created_ts)
+    if created_ts < 0 or created_ts > 0xFFFFFFFF:
+        raise ValueError("created_ts out of range for uint32")
+    ts_bytes = struct.pack(">I", created_ts)
+
+    return bytes(header) + ts_bytes + channel_bytes + nick_bytes + text_bytes
 
 
 def decode_chat_message(data: bytes) -> Optional[ChatMessage]:
@@ -53,10 +68,34 @@ def decode_chat_message(data: bytes) -> Optional[ChatMessage]:
     chan_len = data[2]
     nick_len = data[3]
 
+    # Backward compatibility: v1 had no created_ts.
+    if version == 1:
+        header_len = 4
+        needed = header_len + chan_len + nick_len
+        if len(data) < needed:
+            return None
+
+        channel_bytes = data[header_len: header_len + chan_len]
+        nick_bytes = data[header_len + chan_len: header_len + chan_len + nick_len]
+        text_bytes = data[header_len + chan_len + nick_len:]
+
+        return ChatMessage(
+            msg_type=msg_type,
+            channel=channel_bytes.decode("utf-8", errors="replace"),
+            nick=nick_bytes.decode("utf-8", errors="replace"),
+            text=text_bytes.decode("utf-8", errors="replace"),
+            created_ts=int(time.time()),
+        )
+
     if version != CHAT_VERSION:
         return None
 
     header_len = 4
+    if len(data) < header_len + 4:
+        return None
+    created_ts = struct.unpack(">I", data[header_len: header_len + 4])[0]
+    header_len += 4
+
     needed = header_len + chan_len + nick_len
     if len(data) < needed:
         return None
@@ -70,6 +109,7 @@ def decode_chat_message(data: bytes) -> Optional[ChatMessage]:
         channel=channel_bytes.decode("utf-8", errors="replace"),
         nick=nick_bytes.decode("utf-8", errors="replace"),
         text=text_bytes.decode("utf-8", errors="replace"),
+        created_ts=int(created_ts),
     )
 
 
@@ -77,7 +117,7 @@ def decode_chat_message(data: bytes) -> Optional[ChatMessage]:
 
 @dataclass(frozen=True)
 class SyncRequest:
-    # mode="since_ts" uses {"since_ts": float}
+    # mode="since_ts" uses {"since_ts": float} (interpreted as created_ts seconds)
     # mode="seqno" uses {"mode":"seqno","last_n":int,"inv":{origin_hex:int}}
     mode: str
     since_ts: Optional[float]
@@ -88,6 +128,8 @@ class SyncRequest:
 def encode_sync_request(channel: str, nick: str, since_ts: float) -> bytes:
     """
     Backwards-compatible SYNC_REQUEST v1: text = JSON {"since_ts": float}
+
+    Note: since_ts is interpreted as "created_ts" (unix seconds).
     """
     payload = {"since_ts": since_ts}
     msg = ChatMessage(
@@ -95,6 +137,7 @@ def encode_sync_request(channel: str, nick: str, since_ts: float) -> bytes:
         channel=channel,
         nick=nick,
         text=json.dumps(payload),
+        created_ts=int(time.time()),
     )
     return encode_chat_message(msg)
 
@@ -119,6 +162,7 @@ def encode_sync_request_seqno(
         channel=channel,
         nick=nick,
         text=json.dumps(payload),
+        created_ts=int(time.time()),
     )
     return encode_chat_message(msg)
 
@@ -177,13 +221,16 @@ def encode_sync_response(
 ) -> bytes:
     """
     SYNC_RESPONSE: text = JSON list of records:
-      {"origin_id_hex": str, "seqno": int, "nick": str, "text": str, "ts": float}
+      {"origin_id_hex": str, "seqno": int, "nick": str, "text": str, "ts": int}
+
+    Note: "ts" is the created timestamp (unix seconds).
     """
     msg = ChatMessage(
         msg_type=CHAT_TYPE_SYNC_RESPONSE,
         channel=channel,
         nick=nick,
         text=json.dumps(records),
+        created_ts=int(time.time()),
     )
     return encode_chat_message(msg)
 

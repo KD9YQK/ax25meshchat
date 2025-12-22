@@ -70,6 +70,8 @@ User-generated content is transported inside mesh DATA frames containing:
 - Flags
 - Application payload
 
+Application-layer messages may also include sender-generated timestamps for display and ordering; these values are not used to control transmission timing, duty cycle, or channel access.
+
 ## 7. Deduplication and Forwarding
 
 Each DATA frame is uniquely identified by (origin_id, sequence_number).  

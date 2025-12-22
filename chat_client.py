@@ -62,7 +62,7 @@ class MeshChatClient:
             on_sync_applied: Optional[Callable[[str, int], None]] = None,
     ) -> None:
         """
-        on_chat_message(ChatMessage, origin_id, ts)
+        on_chat_message(ChatMessage, origin_id, created_ts)
         """
         self._config = config
         self._on_chat_message = on_chat_message
@@ -127,11 +127,13 @@ class MeshChatClient:
             channel=channel,
             nick=self._nick,
             text=text,
+            created_ts=int(time.time()),
         )
         payload = encode_chat_message(msg)
         data_seqno = self._mesh_node.send_application_data(dest_node_id, payload)
         # Log locally as "sent"
         now = time.time()
+        created_ts = int(msg.created_ts)
         self._store.add_message(
             origin_id=self.get_node_id(),
             seqno=int(data_seqno),
@@ -139,6 +141,7 @@ class MeshChatClient:
             nick=self._nick,
             text=text,
             ts=now,
+            created_ts=created_ts,
         )
 
     # --------------------------------------------------------------
@@ -305,7 +308,7 @@ class MeshChatClient:
             origin_id: bytes,
             data_seqno: int,
             msg: ChatMessage,
-            ts: float,
+            recv_ts: float,
     ) -> None:
         self._store.add_message(
             origin_id=origin_id,
@@ -313,9 +316,11 @@ class MeshChatClient:
             channel=msg.channel,
             nick=msg.nick,
             text=msg.text,
-            ts=ts,
+            ts=recv_ts,
+            created_ts=int(getattr(msg, "created_ts", int(recv_ts))),
         )
-        self._on_chat_message(msg, origin_id, ts)
+        created_ts = float(getattr(msg, "created_ts", int(recv_ts)))
+        self._on_chat_message(msg, origin_id, created_ts)
 
     def _handle_sync_request(
             self,
@@ -349,7 +354,7 @@ class MeshChatClient:
                         "seqno": int(seqno),
                         "nick": nick,
                         "text": text,
-                        "ts": float(ts),
+                        "ts": int(ts),
                     }
                 )
 
@@ -379,7 +384,7 @@ class MeshChatClient:
                         "seqno": int(seqno),
                         "nick": nick,
                         "text": text,
-                        "ts": float(ts),
+                        "ts": int(ts),
                     }
                 )
                 sent += 1
@@ -423,7 +428,8 @@ class MeshChatClient:
 
             origin_bytes = bytes.fromhex(origin_hex)
             seqno_int = int(seqno_val)
-            ts_float = float(ts_val)
+            created_ts_int = int(ts_val)
+            recv_ts = time.time()
 
             if self._store.has_message(origin_bytes, seqno_int):
                 continue
@@ -434,7 +440,8 @@ class MeshChatClient:
                 channel=msg.channel,
                 nick=nick_val,
                 text=text_val,
-                ts=ts_float,
+                ts=recv_ts,
+                created_ts=created_ts_int,
             )
             applied += 1
 
@@ -443,8 +450,9 @@ class MeshChatClient:
                 channel=msg.channel,
                 nick=nick_val,
                 text=text_val,
+                created_ts=created_ts_int,
             )
-            self._on_chat_message(chat_msg, origin_bytes, ts_float)
+            self._on_chat_message(chat_msg, origin_bytes, float(created_ts_int))
 
         if applied > 0 and self._on_sync_applied is not None:
             self._on_sync_applied(msg.channel, applied)

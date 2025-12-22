@@ -545,6 +545,7 @@ class FakeArdopServer:
                             channel=channel,
                             nick=origin,
                             text=f"{text_prefix} {i_msg + 1}/{count}",
+                            created_ts=int(time.time()),
                         )
                         app = encode_chat_message(msg)
                         mesh = build_fake_data(origin=origin, dest=dest, seqno=seqno, ttl=5, app_payload=app,

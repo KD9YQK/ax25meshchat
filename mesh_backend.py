@@ -24,7 +24,7 @@ class ChatEvent:
     channel: str  # Display channel/tab name (e.g. "#general" or "@K0XYZ-7")
     nick: str
     text: str
-    timestamp: float
+    timestamp: float  # created time (unix seconds)
     origin_id: Optional[bytes] = None
 
 
@@ -48,7 +48,7 @@ class ChannelListEvent:
 @dataclass
 class HistoryEvent:
     channel: str
-    # List of (origin_id, seqno, channel, nick, text, ts)
+    # List of (origin_id, seqno, channel, nick, text, created_ts)
     messages: List[Tuple[bytes, int, str, str, str, float]]
 
 

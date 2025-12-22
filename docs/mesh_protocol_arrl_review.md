@@ -96,8 +96,11 @@ User messages are encapsulated in DATA frames that include:
 - Origin node ID
 - Destination node ID
 - Sequence number
+- Sender-generated message creation timestamp (application-layer metadata only)
 - Explicit flags
 - Application payload
+
+The creation timestamp is used solely for display and ordering of chat history and does not affect routing, forwarding, or any RF timing behavior.
 
 Intermediate nodes forward packets without modifying payload semantics.
 

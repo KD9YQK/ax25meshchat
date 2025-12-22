@@ -31,10 +31,22 @@ class ChatStore:
             nick TEXT NOT NULL,
             text TEXT NOT NULL,
             ts REAL NOT NULL,
+            created_ts INTEGER NOT NULL,
             UNIQUE(origin_id, seqno)
         );
         """
         self._conn.execute(create_sql)
+
+        # Schema migration: add created_ts if upgrading from older DBs.
+        # For legacy rows, default created_ts to receive timestamp (ts) rounded to seconds.
+        try:
+            cols = [r[1] for r in self._conn.execute("PRAGMA table_info(chat_messages);").fetchall()]
+        except sqlite3.Error:
+            cols = []
+        if "created_ts" not in cols:
+            self._conn.execute("ALTER TABLE chat_messages ADD COLUMN created_ts INTEGER;")
+            self._conn.execute("UPDATE chat_messages SET created_ts = CAST(ts AS INTEGER) WHERE created_ts IS NULL;")
+
         self._conn.commit()
 
     def add_message(
@@ -45,21 +57,33 @@ class ChatStore:
             nick: str,
             text: str,
             ts: Optional[float] = None,
+            created_ts: Optional[int] = None,
     ) -> None:
         """
         Insert a message, ignoring if already present.
+
+        Args:
+            origin_id: sender node id
+            seqno: per-origin message sequence number
+            channel: channel / DM key
+            nick: display nickname/callsign
+            text: message body
+            ts: local receive/insert time (float seconds since epoch)
+            created_ts: sender-created timestamp (int unix seconds)
         """
         if ts is None:
             ts = time.time()
+        if created_ts is None:
+            created_ts = int(ts)
 
         insert_sql = """
         INSERT OR IGNORE INTO chat_messages
-            (origin_id, seqno, channel, nick, text, ts)
-        VALUES (?, ?, ?, ?, ?, ?);
+            (origin_id, seqno, channel, nick, text, ts, created_ts)
+        VALUES (?, ?, ?, ?, ?, ?, ?);
         """
         self._conn.execute(
             insert_sql,
-            (origin_id, seqno, channel, nick, text, ts),
+            (origin_id, int(seqno), channel, nick, text, float(ts), int(created_ts)),
         )
         self._conn.commit()
 
@@ -69,7 +93,7 @@ class ChatStore:
         WHERE origin_id = ? AND seqno = ?
         LIMIT 1;
         """
-        cur = self._conn.execute(sql, (origin_id, seqno))
+        cur = self._conn.execute(sql, (origin_id, int(seqno)))
         row = cur.fetchone()
         return row is not None
 
@@ -79,36 +103,36 @@ class ChatStore:
             limit: int = 100,
     ) -> List[Tuple[bytes, int, str, str, str, float]]:
         """
-        Return recent messages for a channel.
+        Return messages for a channel ordered by created time.
 
-        Notes on ordering:
-        - Messages may arrive out-of-order (testing, jitter, retries).
-        - For display in a single combined timeline, we order primarily by timestamp (ts)
-          and use SQLite row id as a stable tiebreaker.
+        For combined timeline display, we order primarily by created_ts (sender time)
+        and use row id as a stable tiebreaker. The returned last element is
+        created_ts as float seconds (for UI formatting).
         """
         if limit <= 0:
             sql_all = """
-            SELECT origin_id, seqno, channel, nick, text, ts
+            SELECT origin_id, seqno, channel, nick, text, created_ts
             FROM chat_messages
             WHERE channel = ?
-            ORDER BY ts ASC, id ASC;
+            ORDER BY created_ts ASC, id ASC;
             """
             cur = self._conn.execute(sql_all, (channel,))
-            return cur.fetchall()
+            rows = cur.fetchall()
+            return [(r[0], int(r[1]), r[2], r[3], r[4], float(r[5])) for r in rows]
 
         sql = """
-        SELECT id, origin_id, seqno, channel, nick, text, ts
+        SELECT id, origin_id, seqno, channel, nick, text, created_ts
         FROM chat_messages
         WHERE channel = ?
         ORDER BY id DESC
         LIMIT ?;
         """
-        cur = self._conn.execute(sql, (channel, limit))
+        cur = self._conn.execute(sql, (channel, int(limit)))
         rows = cur.fetchall()
 
-        # rows: (id, origin_id, seqno, channel, nick, text, ts)
-        rows.sort(key=lambda r: (r[6], r[1], r[2], r[0]))
-        return [(r[1], r[2], r[3], r[4], r[5], r[6]) for r in rows]
+        # rows: (id, origin_id, seqno, channel, nick, text, created_ts)
+        rows.sort(key=lambda r: (r[6], r[0]))
+        return [(r[1], int(r[2]), r[3], r[4], r[5], float(r[6])) for r in rows]
 
     def get_messages_since(
             self,
@@ -117,40 +141,64 @@ class ChatStore:
             limit: int = 100,
     ) -> List[Tuple[bytes, int, str, str, str, float]]:
         """
-        Return messages in a channel with ts > since_ts, ordered by ts.
+        Return messages in a channel with created_ts > since_ts, ordered by created_ts.
         """
         sql = """
-        SELECT origin_id, seqno, channel, nick, text, ts
+        SELECT origin_id, seqno, channel, nick, text, created_ts
         FROM chat_messages
-        WHERE channel = ? AND ts > ?
-        ORDER BY ts ASC
+        WHERE channel = ? AND created_ts > ?
+        ORDER BY created_ts ASC
         LIMIT ?;
         """
-        cur = self._conn.execute(sql, (channel, since_ts, limit))
+        cur = self._conn.execute(sql, (channel, float(since_ts), int(limit)))
         rows = cur.fetchall()
-        return rows
+        return [(r[0], int(r[1]), r[2], r[3], r[4], float(r[5])) for r in rows]
+
+    def get_last_n_messages(
+            self,
+            channel: str,
+            last_n: int,
+    ) -> List[Tuple[bytes, int, str, str, str, float]]:
+        """
+        Return the last N messages for a channel, ordered by created_ts ascending.
+
+        This is used for sync inventory windows.
+        """
+        if last_n <= 0:
+            return []
+
+        sql = """
+        SELECT id, origin_id, seqno, channel, nick, text, created_ts
+        FROM chat_messages
+        WHERE channel = ?
+        ORDER BY created_ts DESC, id DESC
+        LIMIT ?;
+        """
+        cur = self._conn.execute(sql, (channel, int(last_n)))
+        rows = cur.fetchall()
+        rows.sort(key=lambda r: (r[6], r[0]))
+        return [(r[1], int(r[2]), r[3], r[4], r[5], float(r[6])) for r in rows]
 
     def list_channels(self, limit: int = 50) -> List[str]:
         """
-        Return distinct channel identifiers ordered by most recent activity.
-        This includes normal channels (e.g. '#general') and DM channel keys
-        (whatever naming convention the client uses).
+        Return distinct channel identifiers ordered by most recent activity
+        by created time.
         """
         sql = """
-        SELECT channel, MAX(ts) AS last_ts
+        SELECT channel, MAX(created_ts) AS last_ts
         FROM chat_messages
         GROUP BY channel
         ORDER BY last_ts DESC
         LIMIT ?;
         """
-        cur = self._conn.execute(sql, (limit,))
+        cur = self._conn.execute(sql, (int(limit),))
         rows = cur.fetchall()
         return [str(r[0]) for r in rows]
 
     def prune_keep_last_n_per_channel(self, keep_last_n: int) -> int:
         """
         Prune the database by keeping only the most recent `keep_last_n` messages
-        per channel/DM (as identified by the `channel` column).
+        per channel/DM.
 
         Returns:
             Number of rows deleted.
@@ -158,24 +206,21 @@ class ChatStore:
         if keep_last_n < 1:
             raise ValueError("keep_last_n must be >= 1")
 
-        # Determine channels first (including DMs, which are stored as channels)
         channels = self.list_channels(limit=10_000)
         deleted_total = 0
 
         for chan in channels:
-            # Delete all rows for this channel whose id is not in the newest keep_last_n.
-            # Use a subquery selecting newest rows by ts (and id as a tiebreaker).
             delete_sql = """
             DELETE FROM chat_messages
             WHERE channel = ?
               AND id NOT IN (
                 SELECT id FROM chat_messages
                 WHERE channel = ?
-                ORDER BY ts DESC, id DESC
+                ORDER BY created_ts DESC, id DESC
                 LIMIT ?
               );
             """
-            cur = self._conn.execute(delete_sql, (chan, chan, keep_last_n))
+            cur = self._conn.execute(delete_sql, (chan, chan, int(keep_last_n)))
             deleted_total += int(cur.rowcount if cur.rowcount is not None else 0)
 
         self._conn.commit()
