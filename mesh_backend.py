@@ -8,6 +8,8 @@ import time
 from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple
 
+from ardop_link import ArdopLinkError
+
 from chat_client import (
     MeshChatClient,
     MeshChatConfig,
@@ -50,6 +52,22 @@ class HistoryEvent:
     channel: str
     # List of (origin_id, seqno, channel, nick, text, created_ts)
     messages: List[Tuple[bytes, int, str, str, str, float]]
+
+
+# ============================================================
+# Sync retry scheduler (bounded exponential backoff)
+# ============================================================
+
+@dataclass
+class _SyncRetryState:
+    peer_label: str
+    channel: str
+    dest_node_id: bytes
+    last_n: int
+    attempts: int = 0
+    next_due_ts: float = 0.0
+    last_send_ts: float = 0.0
+    gave_up: bool = False
 
 
 UIEvent = ChatEvent | StatusEvent | NodeListEvent | ChannelListEvent | HistoryEvent
@@ -127,12 +145,22 @@ class MeshChatBackend(BackendInterface):
         self._discovered_node_ids: Dict[str, bytes] = {}
         # Per-peer/per-channel sync cooldown tracking
         self._last_sync_time: Dict[Tuple[str, str], float] = {}
+        # Sync retry/backoff scheduler state
+        self._sync_retry: Dict[Tuple[str, str], _SyncRetryState] = {}
+        self._sync_retry_lock = threading.Lock()
+        self._sync_retry_thread = threading.Thread(
+            target=self._sync_retry_loop,
+            name="MeshBackendSyncRetry",
+            daemon=True,
+        )
+        self._sync_retry_thread.start()
 
         # Instantiate client with callback into UI queue
         self._client = MeshChatClient(
             config=config,
             on_chat_message=self._on_chat_message,
             on_sync_applied=self._on_sync_applied,
+            on_gap_report=self._on_gap_report,
         )
 
         # Run MeshChatClient.start() in its own thread
@@ -282,8 +310,14 @@ class MeshChatBackend(BackendInterface):
     def _on_sync_applied(self, channel: str, applied_count: int) -> None:
         """Callback from MeshChatClient when a SYNC_RESPONSE is applied to the DB."""
         self._emit_status(f"Sync applied for {channel}: {applied_count} new message(s)")
+        if applied_count > 0:
+            self._clear_sync_retries_for_channel(channel)
         # Sync can introduce new channels/DMs; refresh left-list.
         self._refresh_channels_from_db()
+
+    def _on_gap_report(self, text: str) -> None:
+        """Callback from MeshChatClient when a gap report is generated."""
+        self._emit_status(text)
 
     def _status_loop(self) -> None:
         while self._running:
@@ -332,7 +366,9 @@ class MeshChatBackend(BackendInterface):
                             self._client.request_sync_last_n(dest_node_id=node_id, channel=channel, last_n=last_n)
                             self._last_sync_time[key] = now
                             self._emit_status(f"Auto-sync requested for {channel} from {callsign}")
-                        except (OSError, ValueError) as exc:
+                            self._schedule_sync_retry(peer_label=callsign, channel=channel, dest_node_id=node_id,
+                                                      last_n=last_n)
+                        except (OSError, ValueError, ArdopLinkError) as exc:
                             self._emit_status(f"Auto-sync request failed for {channel} from {callsign}: {exc}")
 
     def request_history(self, channel: str, limit: int = 200) -> None:
@@ -385,7 +421,8 @@ class MeshChatBackend(BackendInterface):
                 self._client.request_sync_last_n(dest_node_id=node_id, channel=channel, last_n=last_n)
                 self._last_sync_time[key] = now
                 self._emit_status(f"Sync requested for {channel} from {callsign}")
-            except (OSError, ValueError) as exc:
+                self._schedule_sync_retry(peer_label=callsign, channel=channel, dest_node_id=node_id, last_n=last_n)
+            except (OSError, ValueError, ArdopLinkError) as exc:
                 self._emit_status(f"Sync request failed for {channel}: {exc}")
             return
 
@@ -406,7 +443,9 @@ class MeshChatBackend(BackendInterface):
             self._client.request_sync_last_n(dest_node_id=default_peer.node_id, channel=channel, last_n=last_n)
             self._last_sync_time[key] = now
             self._emit_status(f"Sync requested for {channel} from {peer_label}")
-        except (OSError, ValueError) as exc:
+            self._schedule_sync_retry(peer_label=peer_label, channel=channel, dest_node_id=default_peer.node_id,
+                                      last_n=last_n)
+        except (OSError, ValueError, ArdopLinkError) as exc:
             self._emit_status(f"Sync request failed for {channel}: {exc}")
 
     def prune_db(self) -> None:
@@ -422,7 +461,7 @@ class MeshChatBackend(BackendInterface):
 
         try:
             deleted = self._client.prune_db_keep_last_n_per_channel(keep_last_n)
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, ArdopLinkError) as exc:
             self._emit_status(f"DB prune failed: {exc}")
             return
 
@@ -450,3 +489,105 @@ class MeshChatBackend(BackendInterface):
         if new_list != self._last_channels:
             self._last_channels = new_list
             self._ui_queue.put(ChannelListEvent(channels=new_list))
+
+    # ----------------------------------------------------------
+    # Sync retry/backoff scheduler
+    # ----------------------------------------------------------
+
+    def _schedule_sync_retry(
+            self,
+            peer_label: str,
+            channel: str,
+            dest_node_id: bytes,
+            last_n: int,
+    ) -> None:
+        """Schedule bounded retry attempts for a sync request that was already initiated.
+
+        This does not introduce new sync behavior; it only retries after a request
+        has been made (manual or auto-sync). Rate limiting and backoff are handled here.
+        """
+        key = (str(peer_label), str(channel))
+        now = time.time()
+        with self._sync_retry_lock:
+            state = self._sync_retry.get(key)
+            if state is None:
+                state = _SyncRetryState(
+                    peer_label=str(peer_label),
+                    channel=str(channel),
+                    dest_node_id=bytes(dest_node_id),
+                    last_n=int(last_n),
+                    attempts=0,
+                    next_due_ts=now,
+                    last_send_ts=0.0,
+                    gave_up=False,
+                )
+                self._sync_retry[key] = state
+            else:
+                # Reset scheduling to be responsive to a new explicit request
+                state.dest_node_id = bytes(dest_node_id)
+                state.last_n = int(last_n)
+                state.attempts = 0
+                state.gave_up = False
+                state.next_due_ts = now
+
+    def _clear_sync_retries_for_channel(self, channel: str) -> None:
+        """Clear pending retries for a channel once we observe progress."""
+        with self._sync_retry_lock:
+            to_del = [k for k, v in self._sync_retry.items() if v.channel == channel]
+            for k in to_del:
+                del self._sync_retry[k]
+
+    @staticmethod
+    def _compute_backoff_seconds(state: _SyncRetryState) -> float:
+        # 5s * 2^attempts, capped at 120s
+        base = 5.0 * (2.0 ** float(state.attempts))
+        if base > 120.0:
+            base = 120.0
+
+        # Deterministic jitter in [0, 1.0) seconds (no random import)
+        try:
+            b = state.dest_node_id + state.channel.encode("utf-8", errors="ignore")
+            jitter = float(sum(b) % 1000) / 1000.0
+        except (UnicodeError, TypeError, AttributeError):
+            jitter = 0.0
+        return base + jitter
+
+    def _sync_retry_loop(self) -> None:
+        """Background loop that retries previously requested syncs with backoff."""
+        while self._running:
+            time.sleep(0.5)
+            if not self._running:
+                return
+
+            now = time.time()
+            due: List[_SyncRetryState] = []
+
+            with self._sync_retry_lock:
+                for st in self._sync_retry.values():
+                    if st.gave_up:
+                        continue
+                    if st.next_due_ts <= now:
+                        due.append(st)
+
+            for st in due:
+                # Stop after a bounded number of attempts to avoid RF spam.
+                if st.attempts >= 6:
+                    if not st.gave_up:
+                        st.gave_up = True
+                        self._emit_status(f"Sync retry gave up for {st.channel} from {st.peer_label}")
+                    continue
+
+                try:
+                    self._client.request_sync_last_n(
+                        dest_node_id=st.dest_node_id,
+                        channel=st.channel,
+                        last_n=int(st.last_n),
+                    )
+                except (OSError, ValueError, ArdopLinkError) as exc:
+                    # We still back off and retry; just report minimally.
+                    self._emit_status(f"Sync retry failed for {st.channel} from {st.peer_label}: {exc}")
+
+                st.last_send_ts = now
+                st.attempts += 1
+                delay = self._compute_backoff_seconds(st)
+                st.next_due_ts = now + delay

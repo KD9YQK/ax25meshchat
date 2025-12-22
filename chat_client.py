@@ -46,6 +46,214 @@ class MeshChatConfig:
     sync_min_sync_interval_seconds: float = 30.0
 
 
+# --------------------------------------------------------------
+# Gap detection (local, in-memory)
+# --------------------------------------------------------------
+
+class _GapTracker:
+    """Track missing (origin_id, seqno) under out-of-order delivery.
+
+    This is purely observational (no protocol changes, no auto-sync triggers).
+    It distinguishes:
+      - suspected gaps: recently detected, may still be in-flight
+      - confirmed gaps: persisted beyond a local time threshold
+    """
+
+    def __init__(
+            self,
+            confirm_delay_seconds: float = 90.0,
+            min_report_interval_seconds: float = 15.0,
+    ) -> None:
+        self._confirm_delay = float(confirm_delay_seconds)
+        if self._confirm_delay < 0.0:
+            self._confirm_delay = 0.0
+
+        self._min_report_interval = float(min_report_interval_seconds)
+        if self._min_report_interval < 0.0:
+            self._min_report_interval = 0.0
+
+        # origin_hex -> state
+        self._origins: Dict[str, Dict[str, object]] = {}
+
+    @staticmethod
+    def _origin_label(origin_id: bytes) -> str:
+        callsign = origin_id.rstrip(b"\x00").decode("ascii", errors="ignore")
+        if callsign:
+            return callsign
+        return origin_id.hex()
+
+    @staticmethod
+    def _add_range(
+            ranges: List[Tuple[int, int, float]],
+            start: int,
+            end: int,
+            detected_ts: float,
+    ) -> List[Tuple[int, int, float]]:
+        if start > end:
+            return ranges
+
+        new_ranges: List[Tuple[int, int, float]] = []
+        inserted = False
+        s = int(start)
+        e = int(end)
+        ts0 = float(detected_ts)
+
+        for rs, re_, rts in ranges:
+            if re_ + 1 < s:
+                new_ranges.append((rs, re_, rts))
+                continue
+            if e + 1 < rs:
+                if not inserted:
+                    new_ranges.append((s, e, ts0))
+                    inserted = True
+                new_ranges.append((rs, re_, rts))
+                continue
+
+            # overlap/adjacent: merge
+            s = min(s, rs)
+            e = max(e, re_)
+            ts0 = min(ts0, float(rts))
+
+        if not inserted:
+            new_ranges.append((s, e, ts0))
+
+        new_ranges.sort(key=lambda t: t[0])
+        return new_ranges
+
+    @staticmethod
+    def _remove_seq(
+            ranges: List[Tuple[int, int, float]],
+            seqno: int,
+    ) -> List[Tuple[int, int, float]]:
+        x = int(seqno)
+        out: List[Tuple[int, int, float]] = []
+        for rs, re_, rts in ranges:
+            if x < rs or x > re_:
+                out.append((rs, re_, rts))
+                continue
+            # split
+            if rs <= x - 1:
+                out.append((rs, x - 1, rts))
+            if x + 1 <= re_:
+                out.append((x + 1, re_, rts))
+        return out
+
+    @staticmethod
+    def _ranges_signature(ranges: List[Tuple[int, int, float]], confirmed: List[bool]) -> str:
+        parts: List[str] = []
+        for (rs, re_, _), is_conf in zip(ranges, confirmed):
+            parts.append(f"{rs}-{re_}:{'C' if is_conf else 'S'}")
+        return "|".join(parts)
+
+    def on_seqno(self, origin_id: bytes, seqno: int, now: float) -> List[str]:
+        """Ingest a received seqno. Returns any new report lines to emit."""
+        if seqno < 0:
+            return []
+
+        origin_hex = origin_id.hex()
+        st = self._origins.get(origin_hex)
+        if st is None:
+            st = {
+                "hi_contig": -1,
+                "ooo": {},  # seqno -> None
+                "missing": [],  # List[(start,end,detected_ts)]
+                "last_report_ts": 0.0,
+                "last_sig": "",
+            }
+            self._origins[origin_hex] = st
+
+        hi_contig = int(st["hi_contig"])  # type: ignore[assignment]
+        ooo: Dict[int, None] = st["ooo"]  # type: ignore[assignment]
+        missing: List[Tuple[int, int, float]] = st["missing"]  # type: ignore[assignment]
+
+        # Dedup purely in-memory: if we've already seen it, ignore.
+        if seqno <= hi_contig or seqno in ooo:
+            return []
+
+        if seqno == hi_contig + 1:
+            hi_contig = seqno
+            # Advance through any buffered out-of-order messages
+            while (hi_contig + 1) in ooo:
+                del ooo[hi_contig + 1]
+                hi_contig += 1
+        else:
+            # Gap discovered: everything between (hi_contig+1 .. seqno-1)
+            gap_start = hi_contig + 1
+            gap_end = seqno - 1
+            missing = self._add_range(missing, gap_start, gap_end, now)
+            # Buffer this out-of-order seq
+            ooo[seqno] = None
+            # If this seq was previously considered missing, clear it
+            missing = self._remove_seq(missing, seqno)
+
+        # Also clear this seq from missing (in case it was already in a range)
+        missing = self._remove_seq(missing, seqno)
+
+        # If contig advanced, drop any missing ranges that are now below hi_contig
+        if missing:
+            trimmed: List[Tuple[int, int, float]] = []
+            for rs, re_, rts in missing:
+                if re_ <= hi_contig:
+                    continue
+                if rs <= hi_contig:
+                    rs = hi_contig + 1
+                trimmed.append((rs, re_, rts))
+            missing = trimmed
+
+        st["hi_contig"] = hi_contig
+        st["ooo"] = ooo
+        st["missing"] = missing
+
+        return self._maybe_report(origin_id, st, now)
+
+    def _maybe_report(self, origin_id: bytes, st: Dict[str, object], now: float) -> List[str]:
+        missing: List[Tuple[int, int, float]] = st["missing"]  # type: ignore[assignment]
+        if not missing:
+            # If we previously reported gaps, allow a one-time "resolved" message.
+            last_sig = str(st.get("last_sig") or "")
+            if last_sig:
+                last_ts = float(st.get("last_report_ts") or 0.0)
+                if (now - last_ts) >= self._min_report_interval:
+                    st["last_report_ts"] = now
+                    st["last_sig"] = ""
+                    label = self._origin_label(origin_id)
+                    return [f"{label} gaps resolved"]
+            return []
+
+        confirmed_flags: List[bool] = []
+        for rs, re_, detected_ts in missing:
+            confirmed_flags.append((now - float(detected_ts)) >= self._confirm_delay)
+
+        sig = self._ranges_signature(missing, confirmed_flags)
+        last_sig = str(st.get("last_sig") or "")
+        last_ts = float(st.get("last_report_ts") or 0.0)
+
+        if sig == last_sig:
+            return []
+
+        if (now - last_ts) < self._min_report_interval:
+            return []
+
+        st["last_report_ts"] = now
+        st["last_sig"] = sig
+
+        label = self._origin_label(origin_id)
+
+        # Emit one line per status bucket to reduce spam.
+        lines: List[str] = []
+        for want_confirmed in (False, True):
+            bucket: List[Tuple[int, int]] = []
+            for (rs, re_, _), is_conf in zip(missing, confirmed_flags):
+                if is_conf == want_confirmed:
+                    bucket.append((rs, re_))
+            if not bucket:
+                continue
+            ranges_str = ", ".join([f"{a}" if a == b else f"{a}\u2013{b}" for a, b in bucket])
+            state = "confirmed" if want_confirmed else "suspected"
+            lines.append(f"{label} missing seq {ranges_str} ({state})")
+        return lines
+
+
 class MeshChatClient:
     """
     IRC-style chat client on top of MeshNode with:
@@ -60,6 +268,7 @@ class MeshChatClient:
             config: MeshChatConfig,
             on_chat_message: Callable[[ChatMessage, bytes, float], None],
             on_sync_applied: Optional[Callable[[str, int], None]] = None,
+            on_gap_report: Optional[Callable[[str], None]] = None,
     ) -> None:
         """
         on_chat_message(ChatMessage, origin_id, created_ts)
@@ -67,6 +276,8 @@ class MeshChatClient:
         self._config = config
         self._on_chat_message = on_chat_message
         self._on_sync_applied = on_sync_applied
+        self._on_gap_report = on_gap_report
+        self._gap_tracker = _GapTracker()
         self._nick = config.mesh_node_config.callsign  # default nick
 
         self._store = ChatStore(config.db_path)
@@ -319,6 +530,13 @@ class MeshChatClient:
             ts=recv_ts,
             created_ts=int(getattr(msg, "created_ts", int(recv_ts))),
         )
+
+        # Gap detection (local-only)
+        if self._gap_tracker is not None:
+            for line in self._gap_tracker.on_seqno(origin_id=origin_id, seqno=int(data_seqno), now=float(recv_ts)):
+                if self._on_gap_report is not None:
+                    self._on_gap_report(line)
+
         created_ts = float(getattr(msg, "created_ts", int(recv_ts)))
         self._on_chat_message(msg, origin_id, created_ts)
 
@@ -445,7 +663,14 @@ class MeshChatClient:
             )
             applied += 1
 
+            # Gap detection (local-only)
+            if self._gap_tracker is not None:
+                for line in self._gap_tracker.on_seqno(origin_id=origin_bytes, seqno=seqno_int, now=float(recv_ts)):
+                    if self._on_gap_report is not None:
+                        self._on_gap_report(line)
+
             chat_msg = ChatMessage(
+
                 msg_type=CHAT_TYPE_MESSAGE,
                 channel=msg.channel,
                 nick=nick_val,
