@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Any
+from typing import Dict, Any, Optional, List
 import binascii
 
 import yaml  # pip install pyyaml
@@ -18,6 +18,9 @@ from mesh_config import (
     MeshRoutingConfig,
     MeshSecurityConfig,
     MeshNodeConfig,
+    TcpMeshConfig,
+    TcpMeshServerConfig,
+    TcpMeshLinkConfig,
 )
 from chat_client import MeshChatConfig, ChatPeer  # if you're using chat
 
@@ -96,7 +99,7 @@ def _get_required(mapping: Dict[str, Any], key: str) -> Any:
 # ARDOP link config
 # ---------------------------------------------------------------------------
 
-def load_ardop_config(root: Dict[str, Any]) -> ArdopConnectionConfig:
+def load_ardop_config(root: Dict[str, Any]) -> Optional[ArdopConnectionConfig]:
     """Load ARDOP TCP link configuration from top-level `ardop` section.
 
     Example YAML:
@@ -115,6 +118,10 @@ def load_ardop_config(root: Dict[str, Any]) -> ArdopConnectionConfig:
     else:
         ardop_cfg = ardop_cfg_any
 
+    enabled = bool(ardop_cfg.get("enabled", True))
+    if not enabled:
+        return None
+
     host = str(ardop_cfg.get("host", "127.0.0.1"))
     port = int(ardop_cfg.get("port", 8515))
 
@@ -129,6 +136,50 @@ def load_ardop_config(root: Dict[str, Any]) -> ArdopConnectionConfig:
         reconnect_max_delay=reconnect_max_delay,
         tx_queue_size=tx_queue_size,
     )
+
+
+# ---------------------------------------------------------------------------
+# TCP mesh config (optional)
+# ---------------------------------------------------------------------------
+
+def load_tcp_mesh_config(root: Dict[str, Any]) -> Optional[TcpMeshConfig]:
+    tcp_any = root.get("tcp_mesh")
+    if not isinstance(tcp_any, dict):
+        return None
+
+    server_any = tcp_any.get("server", {})
+    if not isinstance(server_any, dict):
+        server_any = {}
+
+    server_cfg = TcpMeshServerConfig(
+        enabled=bool(server_any.get("enabled", False)),
+        server_pw=str(server_any.get("server_pw", "")),
+        server_port=int(server_any.get("server_port", 9000)),
+    )
+
+    links_any = tcp_any.get("links", [])
+    if not isinstance(links_any, list):
+        raise ValueError("tcp_mesh.links must be a list")
+
+    links: List[TcpMeshLinkConfig] = []
+    for entry_any in links_any:
+        if not isinstance(entry_any, dict):
+            raise ValueError("Each tcp_mesh.links entry must be a mapping")
+
+        links.append(
+            TcpMeshLinkConfig(
+                name=str(entry_any.get("name", "tcp-link")),
+                enabled=bool(entry_any.get("enabled", True)),
+                host=str(entry_any.get("host", "127.0.0.1")),
+                port=int(entry_any.get("port", 0)),
+                password=str(entry_any.get("password", "")),
+                reconnect_base_delay=float(entry_any.get("reconnect_base_delay", 5.0)),
+                reconnect_max_delay=float(entry_any.get("reconnect_max_delay", 60.0)),
+                tx_queue_size=int(entry_any.get("tx_queue_size", 1000)),
+            )
+        )
+
+    return TcpMeshConfig(server=server_cfg, links=links)
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +249,7 @@ def load_mesh_node_config(root: Dict[str, Any]) -> MeshNodeConfig:
         ardop_config=ardop_cfg,
         routing_config=routing_cfg,
         security_config=security_cfg,
+        tcp_mesh=load_tcp_mesh_config(root),
     )
 
 

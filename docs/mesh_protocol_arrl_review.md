@@ -241,3 +241,16 @@ The design prioritizes good engineering practice, shared-spectrum respect, and r
 ---
 
 End of document.
+
+
+## 4.x Optional TCP Link Layer (Additional Transport)
+
+While ARDOP remains the primary RF modem link layer, the system also supports an **optional TCP transport** for mesh frames (loopback, LAN, VPN, or WAN).
+
+This TCP transport is implemented strictly **below** the mesh layer:
+- MeshNode routing, OGMs, forwarding, TTL, and deduplication are unchanged.
+- The on-the-wire mesh frame format is unchanged.
+- TCP uses a simple length-prefixed framing identical in concept to the ARDOP host link framing (raw mesh frames delivered to MeshNode unchanged).
+- Multiple link interfaces may be active simultaneously via a link multiplexer (ARDOP + 0..N TCP links).
+
+This enables practical “backbone” connectivity and RF-domain bridging (e.g., VHF ↔ HF) without database sharing or application-layer hacks.

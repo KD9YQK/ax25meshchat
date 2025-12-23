@@ -8,8 +8,8 @@ connection config.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Optional, List
 
 
 @dataclass
@@ -40,7 +40,7 @@ class MeshRoutingConfig:
     """Routing and neighbor behavior."""
 
     ogm_interval_seconds: float = 600.0  # how often to send OGMs
-    ogm_ttl: int = 5                     # hop limit for OGMs
+    ogm_ttl: int = 5  # hop limit for OGMs
     route_expiry_seconds: float = 120.0
     neighbor_expiry_seconds: float = 60.0
     data_seen_expiry_seconds: float = 30.0
@@ -58,6 +58,31 @@ class MeshSecurityConfig:
 
 
 @dataclass
+class TcpMeshServerConfig:
+    enabled: bool = False
+    server_pw: str = ""
+    server_port: int = 9000
+
+
+@dataclass
+class TcpMeshLinkConfig:
+    name: str
+    enabled: bool
+    host: str
+    port: int
+    password: str
+    reconnect_base_delay: float = 5.0
+    reconnect_max_delay: float = 60.0
+    tx_queue_size: int = 1000
+
+
+@dataclass
+class TcpMeshConfig:
+    server: TcpMeshServerConfig = TcpMeshServerConfig()
+    links: List[TcpMeshLinkConfig] = field(default_factory=list)
+
+
+@dataclass
 class MeshNodeConfig:
     """Overall node configuration."""
 
@@ -67,5 +92,7 @@ class MeshNodeConfig:
     # ARDOP link-layer connection settings
     ardop_config: Optional[ArdopConnectionConfig] = None
 
+    # Optional TCP mesh links (server and/or client links)
+    tcp_mesh: Optional[TcpMeshConfig] = None
     routing_config: MeshRoutingConfig = MeshRoutingConfig()
     security_config: MeshSecurityConfig = MeshSecurityConfig()

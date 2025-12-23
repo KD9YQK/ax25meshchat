@@ -32,3 +32,12 @@
 ## Summary
 
 This protocol occupies a middle ground between AX.25 simplicity and AREDN throughput, prioritizing efficient narrowband experimentation.
+
+## TCP-Based Backbones (Optional)
+
+This system can optionally carry the same mesh frames over TCP sockets (LAN/VPN/WAN) as a secondary link transport. This is not an IP-routed mesh like AREDN; it is simply an additional link layer beneath the existing mesh protocol, used for:
+- Wired backbones between RF islands
+- Bridging different RF domains (e.g., VHF ↔ HF)
+- Loopback/LAN testing without RF
+
+Routing behavior, TTL, deduplication, and message formats remain identical.

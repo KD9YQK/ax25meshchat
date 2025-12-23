@@ -179,3 +179,15 @@ This mesh protocol is open, inspectable, spectrally efficient, and aligned with 
 
 Compression reduces airtime only and does not obscure meaning.  
 Packet formats are fully documented and auditable.
+
+
+## 3.x Optional TCP Link Transport (Non-RF)
+
+In addition to ARDOP-over-RF, the implementation can optionally transport the **same mesh frames over TCP** (loopback, LAN, VPN, or WAN). This is strictly a link-layer transport choice and does not alter protocol fields or RF emission characteristics.
+
+- **No protocol changes:** mesh header/body formats are unchanged.
+- **Same framing concept as ARDOP link:** raw mesh frames are length-prefixed over the TCP stream.
+- **Multiple interfaces:** a node may run ARDOP and one or more TCP links simultaneously, enabling bridging and backbone use.
+- **Link-local TCP access control:** TCP peering may require a password to prevent unintended connections. This is not encryption of content and is not used to obscure meaning.
+
+When TCP is disabled (default), behavior is identical to RF-only operation.

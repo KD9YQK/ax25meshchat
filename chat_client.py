@@ -6,9 +6,10 @@ from typing import Callable, Dict, List, Tuple, Optional
 
 from mesh_config import (
     MeshNodeConfig,
-    ArdopConnectionConfig,
 )
 from ardop_link import ArdopLinkClient
+from tcp_link import TcpLinkClient
+from multiplex_link import MultiplexLinkClient
 from mesh_node import MeshNode
 from chat_store import ChatStore
 from chat_protocol import (
@@ -300,26 +301,87 @@ class MeshChatClient:
         self._store = ChatStore(config.db_path)
 
         def link_client_factory(rx_callback):
-            ardop_cfg = config.mesh_node_config.ardop_config
-            if ardop_cfg is None:
-                ardop_cfg = ArdopConnectionConfig()
-            return ArdopLinkClient(ardop_cfg, rx_callback, name="mesh-ardop-link")
+            links = []
 
-        self._mesh_node = MeshNode(
-            config=config.mesh_node_config,
-            link_client_factory=link_client_factory,
-            app_data_callback=self._on_mesh_app_data,
-        )
+            # --- ARDOP link (optional; existing behavior when enabled) ---
+            ardop_cfg = config.mesh_node_config.ardop_config
+            if ardop_cfg is not None:
+                links.append(ArdopLinkClient(ardop_cfg, rx_callback, name="mesh-ardop-link"))
+
+            # --- TCP mesh (optional; additive) ---
+            tcp_cfg = getattr(config.mesh_node_config, "tcp_mesh", None)
+            if tcp_cfg is not None:
+                # Server mode (accept inbound connections)
+                srv = getattr(tcp_cfg, "server", None)
+                if srv is not None and bool(getattr(srv, "enabled", False)):
+                    server_port = int(getattr(srv, "server_port", 9000))
+                    server_pw = str(getattr(srv, "server_pw", "") or "")
+                    links.append(
+                        TcpLinkClient.server(
+                            port=server_port,
+                            server_pw=server_pw,
+                            rx_callback=rx_callback,
+                            name="mesh-tcp-server",
+                        )
+                    )
+
+                # Client links (connect out)
+                link_list = getattr(tcp_cfg, "links", [])
+                for link in link_list:
+                    if not bool(getattr(link, "enabled", True)):
+                        continue
+                    name = str(getattr(link, "name", "tcp-link"))
+                    host = str(getattr(link, "host", "127.0.0.1"))
+                    port = int(getattr(link, "port", 0))
+                    pw = str(getattr(link, "password", "") or "")
+                    base = float(getattr(link, "reconnect_base_delay", 5.0))
+                    maxd = float(getattr(link, "reconnect_max_delay", 60.0))
+                    qsz = int(getattr(link, "tx_queue_size", 1000))
+
+                    links.append(
+                        TcpLinkClient.client(
+                            host=host,
+                            port=port,
+                            password=pw,
+                            rx_callback=rx_callback,
+                            reconnect_base_delay=base,
+                            reconnect_max_delay=maxd,
+                            tx_queue_size=qsz,
+                            name=f"mesh-tcp-{name}",
+                        )
+                    )
+
+            if not links:
+                raise ValueError("No enabled links configured (ARDOP disabled and TCP disabled).")
+
+            if len(links) == 1:
+                return links[0]
+            return MultiplexLinkClient(links)
+
+        self._startup_error: Optional[str] = None
+        try:
+            self._mesh_node = MeshNode(
+                config=config.mesh_node_config,
+                link_client_factory=link_client_factory,
+                app_data_callback=self._on_mesh_app_data,
+            )
+        except ValueError as exc:
+            # Allow GUI to start with no enabled links configured so the user can edit config.
+            self._mesh_node = None
+            self._startup_error = str(exc)
 
     # --------------------------------------------------------------
     # Lifecycle
     # --------------------------------------------------------------
 
     def start(self) -> None:
+        if self._mesh_node is None:
+            return
         self._mesh_node.start()
 
     def stop(self) -> None:
-        self._mesh_node.stop()
+        if self._mesh_node is not None:
+            self._mesh_node.stop()
         self._store.close()
 
     def set_nick(self, nick: str) -> None:
@@ -327,6 +389,8 @@ class MeshChatClient:
 
     def get_node_id(self) -> bytes:
         """Return our local 8-byte node ID."""
+        if self._mesh_node is None:
+            return b""
         return getattr(self._mesh_node, "_node_id", b"")
 
     # --------------------------------------------------------------
@@ -350,6 +414,8 @@ class MeshChatClient:
             channel: str,
             text: str,
     ) -> None:
+        if self._mesh_node is None:
+            raise ValueError(self._startup_error or "Mesh node not started")
         msg = ChatMessage(
             msg_type=CHAT_TYPE_MESSAGE,
             channel=channel,
@@ -394,6 +460,8 @@ class MeshChatClient:
             channel: str,
             last_n: Optional[int] = None,
     ) -> None:
+        if self._mesh_node is None:
+            raise ValueError(self._startup_error or "Mesh node not started")
         """
         v2: Ask a peer for missing messages within the last N window using seqno inventory.
 
@@ -429,6 +497,8 @@ class MeshChatClient:
             start_seqno: int,
             end_seqno: int,
     ) -> None:
+        if self._mesh_node is None:
+            raise ValueError(self._startup_error or "Mesh node not started")
         """
         Targeted sync: ask a peer for a specific (origin_id, seqno range) within a channel.
         """
