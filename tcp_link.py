@@ -35,6 +35,10 @@ LOG = logging.getLogger(__name__)
 
 _HANDSHAKE_MAGIC = b"QMESH1"
 
+_HS_OK = b"\x00"
+_HS_BAD_PW = b"\x01"
+_HS_BAD_HANDSHAKE = b"\x02"
+
 
 class TcpLinkError(Exception):
     pass
@@ -67,12 +71,12 @@ class TcpLinkClient:
     """
 
     def __init__(
-        self,
-        *,
-        rx_callback: Callable[[bytes], None],
-        name: str,
-        client_cfg: Optional[TcpClientConfig] = None,
-        server_cfg: Optional[TcpServerConfig] = None,
+            self,
+            *,
+            rx_callback: Callable[[bytes], None],
+            name: str,
+            client_cfg: Optional[TcpClientConfig] = None,
+            server_cfg: Optional[TcpServerConfig] = None,
     ) -> None:
         if (client_cfg is None) == (server_cfg is None):
             raise ValueError("Exactly one of client_cfg or server_cfg must be set")
@@ -98,23 +102,23 @@ class TcpLinkClient:
         if self._server_cfg is not None:
             tx_qsz = int(self._server_cfg.tx_queue_size)
 
-        self._tx_queue: "queue.Queue[bytes]" = queue.Queue(maxsize=tx_qsz)
+        self._tx_queue: queue.Queue[bytes] = queue.Queue(maxsize=tx_qsz)
         self._rx_buffer = bytearray()
         self._lock = threading.Lock()
 
     @classmethod
     def client(
-        cls,
-        *,
-        host: str,
-        port: int,
-        password: str,
-        rx_callback: Callable[[bytes], None],
-        reconnect_base_delay: float = 5.0,
-        reconnect_max_delay: float = 60.0,
-        tx_queue_size: int = 1000,
-        name: str = "tcp-client-link",
-    ) -> "TcpLinkClient":
+            cls,
+            *,
+            host: str,
+            port: int,
+            password: str,
+            rx_callback: Callable[[bytes], None],
+            reconnect_base_delay: float = 5.0,
+            reconnect_max_delay: float = 60.0,
+            tx_queue_size: int = 1000,
+            name: str = "tcp-client-link",
+    ) -> TcpLinkClient:
         return cls(
             rx_callback=rx_callback,
             name=name,
@@ -130,14 +134,14 @@ class TcpLinkClient:
 
     @classmethod
     def server(
-        cls,
-        *,
-        port: int,
-        server_pw: str,
-        rx_callback: Callable[[bytes], None],
-        tx_queue_size: int = 1000,
-        name: str = "tcp-server-link",
-    ) -> "TcpLinkClient":
+            cls,
+            *,
+            port: int,
+            server_pw: str,
+            rx_callback: Callable[[bytes], None],
+            tx_queue_size: int = 1000,
+            name: str = "tcp-server-link",
+    ) -> TcpLinkClient:
         return cls(
             rx_callback=rx_callback,
             name=name,
@@ -156,6 +160,11 @@ class TcpLinkClient:
         if self._running.is_set():
             return
         self._running.set()
+
+        if self._server_cfg is not None:
+            LOG.info("%s starting in SERVER mode on port %d", self._name, self._server_cfg.port)
+        if self._client_cfg is not None:
+            LOG.info("%s starting in CLIENT mode to %s:%d", self._name, self._client_cfg.host, self._client_cfg.port)
 
         self._rx_thread = threading.Thread(
             target=self._rx_loop,
@@ -226,6 +235,7 @@ class TcpLinkClient:
 
         while self._running.is_set() and not self._connected.is_set():
             try:
+                LOG.info("%s connecting to %s:%d", self._name, self._client_cfg.host, self._client_cfg.port)
                 sock = socket.create_connection((self._client_cfg.host, self._client_cfg.port), timeout=10.0)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 sock.settimeout(5.0)
@@ -241,8 +251,15 @@ class TcpLinkClient:
                     self._sock = sock
                     self._rx_buffer.clear()
                     self._connected.set()
+                LOG.info("%s connected to %s:%d", self._name, self._client_cfg.host, self._client_cfg.port)
                 return
-            except OSError:
+            except TcpLinkError as exc:
+                # Bad password / handshake: do not retry forever.
+                LOG.error("%s handshake failed: %s (stopping)", self._name, exc)
+                self.stop()
+                return
+            except OSError as exc:
+                LOG.warning("%s connect failed (%s); retrying in %.1fs", self._name, exc, delay)
                 time.sleep(delay)
                 delay *= 2.0
                 if delay > self._client_cfg.reconnect_max_delay:
@@ -259,6 +276,7 @@ class TcpLinkClient:
             srv.listen(1)
             srv.settimeout(2.0)
             self._srv_sock = srv
+            LOG.info("%s listening on 0.0.0.0:%d", self._name, self._server_cfg.port)
 
     def _accept_server(self) -> None:
         assert self._server_cfg is not None
@@ -272,10 +290,13 @@ class TcpLinkClient:
                 conn.settimeout(5.0)
 
                 if not self._server_handshake(conn, self._server_cfg.server_pw):
+                    LOG.warning("%s rejected connection (bad password or handshake)", self._name)
                     try:
                         conn.close()
                     except OSError:
                         pass
+                    # Avoid busy-loop / flood amplification on repeated bad attempts
+                    time.sleep(0.25)
                     continue
 
                 with self._lock:
@@ -303,16 +324,53 @@ class TcpLinkClient:
         hdr = _HANDSHAKE_MAGIC + pw_len.to_bytes(2, "big")
         sock.sendall(hdr + pw_bytes)
 
+        # Wait for server response (1 byte)
+        resp = TcpLinkClient._recv_exact(sock, 1)
+        if resp == _HS_OK:
+            return
+        if resp == _HS_BAD_PW:
+            raise TcpLinkError("Server rejected password")
+        raise TcpLinkError("Server rejected handshake")
+
     @staticmethod
     def _server_handshake(sock: socket.socket, expected_pw: str) -> bool:
-        header = TcpLinkClient._recv_exact(sock, 8)
-        if header[:6] != _HANDSHAKE_MAGIC:
+        try:
+            header = TcpLinkClient._recv_exact(sock, 8)
+        except OSError:
             return False
+
+        if header[:6] != _HANDSHAKE_MAGIC:
+            try:
+                sock.sendall(_HS_BAD_HANDSHAKE)
+            except OSError:
+                pass
+            return False
+
         pw_len = int.from_bytes(header[6:8], "big")
         if pw_len < 0 or pw_len > 65535:
+            try:
+                sock.sendall(_HS_BAD_HANDSHAKE)
+            except OSError:
+                pass
             return False
-        pw = TcpLinkClient._recv_exact(sock, pw_len)
-        return pw == expected_pw.encode("utf-8")
+
+        try:
+            pw = TcpLinkClient._recv_exact(sock, pw_len)
+        except OSError:
+            return False
+
+        if pw != expected_pw.encode("utf-8"):
+            try:
+                sock.sendall(_HS_BAD_PW)
+            except OSError:
+                pass
+            return False
+
+        try:
+            sock.sendall(_HS_OK)
+        except OSError:
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # RX/TX loops + framing
@@ -395,6 +453,7 @@ class TcpLinkClient:
                 self._drop_connection()
 
     def _drop_connection(self) -> None:
+        LOG.warning("%s connection dropped", self._name)
         with self._lock:
             if self._sock is not None:
                 try:

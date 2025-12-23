@@ -358,21 +358,30 @@ class MeshChatClient:
                 return links[0]
             return MultiplexLinkClient(links)
 
-        self._mesh_node = MeshNode(
-            config=config.mesh_node_config,
-            link_client_factory=link_client_factory,
-            app_data_callback=self._on_mesh_app_data,
-        )
+        self._startup_error: Optional[str] = None
+        try:
+            self._mesh_node = MeshNode(
+                config=config.mesh_node_config,
+                link_client_factory=link_client_factory,
+                app_data_callback=self._on_mesh_app_data,
+            )
+        except ValueError as exc:
+            # Allow GUI to start with no enabled links configured so the user can edit config.
+            self._mesh_node = None
+            self._startup_error = str(exc)
 
     # --------------------------------------------------------------
     # Lifecycle
     # --------------------------------------------------------------
 
     def start(self) -> None:
+        if self._mesh_node is None:
+            return
         self._mesh_node.start()
 
     def stop(self) -> None:
-        self._mesh_node.stop()
+        if self._mesh_node is not None:
+            self._mesh_node.stop()
         self._store.close()
 
     def set_nick(self, nick: str) -> None:
@@ -380,6 +389,8 @@ class MeshChatClient:
 
     def get_node_id(self) -> bytes:
         """Return our local 8-byte node ID."""
+        if self._mesh_node is None:
+            return b""
         return getattr(self._mesh_node, "_node_id", b"")
 
     # --------------------------------------------------------------
@@ -403,6 +414,8 @@ class MeshChatClient:
             channel: str,
             text: str,
     ) -> None:
+        if self._mesh_node is None:
+            raise ValueError(self._startup_error or "Mesh node not started")
         msg = ChatMessage(
             msg_type=CHAT_TYPE_MESSAGE,
             channel=channel,
@@ -447,6 +460,8 @@ class MeshChatClient:
             channel: str,
             last_n: Optional[int] = None,
     ) -> None:
+        if self._mesh_node is None:
+            raise ValueError(self._startup_error or "Mesh node not started")
         """
         v2: Ask a peer for missing messages within the last N window using seqno inventory.
 
@@ -482,6 +497,8 @@ class MeshChatClient:
             start_seqno: int,
             end_seqno: int,
     ) -> None:
+        if self._mesh_node is None:
+            raise ValueError(self._startup_error or "Mesh node not started")
         """
         Targeted sync: ask a peer for a specific (origin_id, seqno range) within a channel.
         """

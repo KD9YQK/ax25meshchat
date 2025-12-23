@@ -56,14 +56,14 @@ gui:
 tcp_mesh:
   server:
     enabled: true
-    server_pw: password
+    server_pw: passworda
     server_port: 9000
   links:
   - name: loopback-test
-    enabled: false
+    enabled: true
     host: 127.0.0.1
     port: 9000
-    password: example-password
+    password: passworda
     reconnect_base_delay: 5.0
     reconnect_max_delay: 60.0
     tx_queue_size: 1000
