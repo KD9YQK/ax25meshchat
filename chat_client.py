@@ -6,9 +6,10 @@ from typing import Callable, Dict, List, Tuple, Optional
 
 from mesh_config import (
     MeshNodeConfig,
-    ArdopConnectionConfig,
 )
 from ardop_link import ArdopLinkClient
+from tcp_link import TcpLinkClient
+from multiplex_link import MultiplexLinkClient
 from mesh_node import MeshNode
 from chat_store import ChatStore
 from chat_protocol import (
@@ -300,10 +301,62 @@ class MeshChatClient:
         self._store = ChatStore(config.db_path)
 
         def link_client_factory(rx_callback):
+            links = []
+
+            # --- ARDOP link (optional; existing behavior when enabled) ---
             ardop_cfg = config.mesh_node_config.ardop_config
-            if ardop_cfg is None:
-                ardop_cfg = ArdopConnectionConfig()
-            return ArdopLinkClient(ardop_cfg, rx_callback, name="mesh-ardop-link")
+            if ardop_cfg is not None:
+                links.append(ArdopLinkClient(ardop_cfg, rx_callback, name="mesh-ardop-link"))
+
+            # --- TCP mesh (optional; additive) ---
+            tcp_cfg = getattr(config.mesh_node_config, "tcp_mesh", None)
+            if tcp_cfg is not None:
+                # Server mode (accept inbound connections)
+                srv = getattr(tcp_cfg, "server", None)
+                if srv is not None and bool(getattr(srv, "enabled", False)):
+                    server_port = int(getattr(srv, "server_port", 9000))
+                    server_pw = str(getattr(srv, "server_pw", "") or "")
+                    links.append(
+                        TcpLinkClient.server(
+                            port=server_port,
+                            server_pw=server_pw,
+                            rx_callback=rx_callback,
+                            name="mesh-tcp-server",
+                        )
+                    )
+
+                # Client links (connect out)
+                link_list = getattr(tcp_cfg, "links", [])
+                for link in link_list:
+                    if not bool(getattr(link, "enabled", True)):
+                        continue
+                    name = str(getattr(link, "name", "tcp-link"))
+                    host = str(getattr(link, "host", "127.0.0.1"))
+                    port = int(getattr(link, "port", 0))
+                    pw = str(getattr(link, "password", "") or "")
+                    base = float(getattr(link, "reconnect_base_delay", 5.0))
+                    maxd = float(getattr(link, "reconnect_max_delay", 60.0))
+                    qsz = int(getattr(link, "tx_queue_size", 1000))
+
+                    links.append(
+                        TcpLinkClient.client(
+                            host=host,
+                            port=port,
+                            password=pw,
+                            rx_callback=rx_callback,
+                            reconnect_base_delay=base,
+                            reconnect_max_delay=maxd,
+                            tx_queue_size=qsz,
+                            name=f"mesh-tcp-{name}",
+                        )
+                    )
+
+            if not links:
+                raise ValueError("No enabled links configured (ARDOP disabled and TCP disabled).")
+
+            if len(links) == 1:
+                return links[0]
+            return MultiplexLinkClient(links)
 
         self._mesh_node = MeshNode(
             config=config.mesh_node_config,

@@ -34,11 +34,27 @@ TOOLTIPS: Dict[str, str] = {
     "mesh.callsign": "Your station callsign/SSID used as the node identifier on the mesh (e.g., KD9YQK-1).",
     "mesh.mesh_dest_callsign": "The destination callsign used for mesh frames (a shared 'group' callsign, e.g., QMESH-0).",
 
+    "ardop.enabled": "Enable/disable the ARDOP (radio) link layer. Disable to run TCP-only nodes.",
     "ardop.host": "IP/hostname of the ARDOP TNC/host interface (usually 127.0.0.1 if ardop is local).",
     "ardop.port": "TCP port for the ARDOP Host/TNC interface (default is often 8515).",
     "ardop.reconnect_base_delay": "Seconds to wait before retrying after a disconnect (base delay; exponential backoff may apply).",
     "ardop.reconnect_max_delay": "Maximum seconds between reconnect attempts (caps the backoff).",
     "ardop.tx_queue_size": "Max number of outbound payloads queued for transmit (prevents unbounded memory growth).",
+
+    "tcp_mesh": "Optional TCP mesh links. Use for LAN/VPN/WAN backbones or bridging RF domains. Disabled by default.",
+    "tcp_mesh.server": "TCP mesh server settings (accept inbound TCP mesh clients).",
+    "tcp_mesh.server.enabled": "Enable the TCP mesh server listener.",
+    "tcp_mesh.server.server_port": "TCP port the server listens on for inbound mesh clients.",
+    "tcp_mesh.server.server_pw": "Password required for inbound TCP mesh clients (handshake).",
+    "tcp_mesh.links": "TCP mesh client links (connect out to other TCP mesh servers). You may define multiple.",
+    "tcp_mesh.link.name": "Local name for this TCP link (not transmitted).",
+    "tcp_mesh.link.enabled": "Enable/disable this TCP client link.",
+    "tcp_mesh.link.host": "Remote host/IP of the TCP mesh server to connect to.",
+    "tcp_mesh.link.port": "Remote TCP port of the TCP mesh server to connect to.",
+    "tcp_mesh.link.password": "Password to present when connecting to the remote TCP mesh server.",
+    "tcp_mesh.link.reconnect_base_delay": "Seconds before retrying after disconnect (base delay; exponential backoff applies).",
+    "tcp_mesh.link.reconnect_max_delay": "Maximum seconds between reconnect attempts (caps the backoff).",
+    "tcp_mesh.link.tx_queue_size": "Max number of outbound payloads queued for this TCP link.",
 
     "routing.ogm_interval_seconds": "Seconds between OGM (Originator) beacons. Longer is quieter on RF; shorter converges faster.",
     "routing.ogm_ttl": "How many hops an OGM is forwarded (mesh diameter limit).",
@@ -138,6 +154,18 @@ class PeerRow:
     nick: str
 
 
+@dataclass
+class TcpLinkRow:
+    name: str
+    enabled: bool
+    host: str
+    port: int
+    password: str
+    reconnect_base_delay: float
+    reconnect_max_delay: float
+    tx_queue_size: int
+
+
 class PeerEditDialog(wx.Dialog):
     def __init__(self, parent: wx.Window, title: str, initial: Optional[PeerRow] = None) -> None:
         super().__init__(parent, title=title, style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
@@ -180,7 +208,7 @@ class PeerEditDialog(wx.Dialog):
 
         self.Bind(wx.EVT_BUTTON, self._on_ok, id=wx.ID_OK)
 
-    def _on_ok(self, event: wx.CommandEvent) -> None:
+    def _on_ok(self, _event: wx.CommandEvent) -> None:
         key = self.key_ctrl.GetValue().strip()
         node_id = self.node_id_ctrl.GetValue().strip()
         nick = self.nick_ctrl.GetValue().strip()
@@ -200,13 +228,118 @@ class PeerEditDialog(wx.Dialog):
             wx.MessageBox("Nick cannot be empty.", "Validation", wx.ICON_WARNING)
             return
 
-        event.Skip()
+        self.EndModal(wx.ID_OK)
 
     def get_peer(self) -> PeerRow:
         return PeerRow(
             key=self.key_ctrl.GetValue().strip(),
             node_id_hex=self.node_id_ctrl.GetValue().strip(),
             nick=self.nick_ctrl.GetValue().strip(),
+        )
+
+
+class TcpLinkEditDialog(wx.Dialog):
+    def __init__(self, parent: wx.Window, title: str, initial: Optional[TcpLinkRow] = None) -> None:
+        super().__init__(parent, title=title, style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        grid = wx.FlexGridSizer(rows=8, cols=2, vgap=8, hgap=8)
+        grid.AddGrowableCol(1, 1)
+
+        self.name_ctrl = wx.TextCtrl(self)
+        self.name_ctrl.SetToolTip(TOOLTIPS["tcp_mesh.link.name"])
+
+        self.enabled_ctrl = wx.CheckBox(self, label="")
+        self.enabled_ctrl.SetToolTip(TOOLTIPS["tcp_mesh.link.enabled"])
+
+        self.host_ctrl = wx.TextCtrl(self)
+        self.host_ctrl.SetToolTip(TOOLTIPS["tcp_mesh.link.host"])
+
+        self.port_ctrl = wx.SpinCtrl(self, min=1, max=65535, initial=9000)
+        self.port_ctrl.SetToolTip(TOOLTIPS["tcp_mesh.link.port"])
+
+        self.password_ctrl = wx.TextCtrl(self, style=wx.TE_PASSWORD)
+        self.password_ctrl.SetToolTip(TOOLTIPS["tcp_mesh.link.password"])
+
+        self.reconnect_base_ctrl = wx.TextCtrl(self, value="5.0")
+        self.reconnect_base_ctrl.SetToolTip(TOOLTIPS["tcp_mesh.link.reconnect_base_delay"])
+
+        self.reconnect_max_ctrl = wx.TextCtrl(self, value="60.0")
+        self.reconnect_max_ctrl.SetToolTip(TOOLTIPS["tcp_mesh.link.reconnect_max_delay"])
+
+        self.tx_queue_ctrl = wx.SpinCtrl(self, min=1, max=1_000_000, initial=1000)
+        self.tx_queue_ctrl.SetToolTip(TOOLTIPS["tcp_mesh.link.tx_queue_size"])
+
+        grid.Add(wx.StaticText(self, label="Name"), 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self.name_ctrl, 1, wx.EXPAND)
+        grid.Add(wx.StaticText(self, label="Enabled"), 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self.enabled_ctrl, 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(wx.StaticText(self, label="Host"), 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self.host_ctrl, 1, wx.EXPAND)
+        grid.Add(wx.StaticText(self, label="Port"), 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self.port_ctrl, 0)
+        grid.Add(wx.StaticText(self, label="Password"), 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self.password_ctrl, 1, wx.EXPAND)
+        grid.Add(wx.StaticText(self, label="Reconnect base (s)"), 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self.reconnect_base_ctrl, 1, wx.EXPAND)
+        grid.Add(wx.StaticText(self, label="Reconnect max (s)"), 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self.reconnect_max_ctrl, 1, wx.EXPAND)
+        grid.Add(wx.StaticText(self, label="TX queue size"), 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self.tx_queue_ctrl, 0)
+
+        sizer.Add(grid, 0, wx.EXPAND | wx.ALL, 12)
+
+        btns = self.CreateSeparatedButtonSizer(wx.OK | wx.CANCEL)
+        if btns:
+            sizer.Add(btns, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
+
+        self.SetSizerAndFit(sizer)
+        self.SetMinSize(wx.Size(520, -1))
+
+        if initial:
+            self.name_ctrl.SetValue(initial.name)
+            self.enabled_ctrl.SetValue(bool(initial.enabled))
+            self.host_ctrl.SetValue(initial.host)
+            self.port_ctrl.SetValue(int(initial.port))
+            self.password_ctrl.SetValue(initial.password)
+            self.reconnect_base_ctrl.SetValue(str(initial.reconnect_base_delay))
+            self.reconnect_max_ctrl.SetValue(str(initial.reconnect_max_delay))
+            self.tx_queue_ctrl.SetValue(int(initial.tx_queue_size))
+
+        self.Bind(wx.EVT_BUTTON, self._on_ok, id=wx.ID_OK)
+
+    def _on_ok(self, _event: wx.CommandEvent) -> None:
+        name = self.name_ctrl.GetValue().strip()
+        host = self.host_ctrl.GetValue().strip()
+        pw = self.password_ctrl.GetValue()
+
+        if not name:
+            wx.MessageBox("Link name cannot be empty.", "Validation", wx.ICON_WARNING)
+            return
+        if not host:
+            wx.MessageBox("Host cannot be empty.", "Validation", wx.ICON_WARNING)
+            return
+        if not pw:
+            wx.MessageBox("Password cannot be empty.", "Validation", wx.ICON_WARNING)
+            return
+        try:
+            float(self.reconnect_base_ctrl.GetValue().strip())
+            float(self.reconnect_max_ctrl.GetValue().strip())
+        except ValueError:
+            wx.MessageBox("Reconnect delays must be numbers.", "Validation", wx.ICON_WARNING)
+            return
+        self.EndModal(wx.ID_OK)
+
+    def get_link(self) -> TcpLinkRow:
+        return TcpLinkRow(
+            name=self.name_ctrl.GetValue().strip(),
+            enabled=bool(self.enabled_ctrl.GetValue()),
+            host=self.host_ctrl.GetValue().strip(),
+            port=int(self.port_ctrl.GetValue()),
+            password=self.password_ctrl.GetValue(),
+            reconnect_base_delay=float(self.reconnect_base_ctrl.GetValue().strip()),
+            reconnect_max_delay=float(self.reconnect_max_ctrl.GetValue().strip()),
+            tx_queue_size=int(self.tx_queue_ctrl.GetValue()),
         )
 
 
@@ -222,6 +355,7 @@ class ConfigEditorDialog(wx.Dialog):
 
         self._build_mesh_tab()
         self._build_ardop_tab()
+        self._build_tcp_mesh_tab()
         self._build_routing_tab()
         self._build_security_tab()
         self._build_chat_tab()
@@ -276,6 +410,11 @@ class ConfigEditorDialog(wx.Dialog):
         panel = wx.Panel(self.nb)
         vs = wx.BoxSizer(wx.VERTICAL)
 
+        self.ardop_enabled = wx.CheckBox(panel, label="Enable ARDOP")
+        self.ardop_enabled.SetValue(bool(_deep_get(self.data, "ardop.enabled", True)))
+        self.ardop_enabled.SetToolTip(TOOLTIPS["ardop.enabled"])
+        vs.Add(self.ardop_enabled, 0, wx.ALL, 8)
+
         self.ardop_host = wx.TextCtrl(panel, value=str(_deep_get(self.data, "ardop.host", "")))
         vs.Add(self._make_labeled(panel, "Host", self.ardop_host, TOOLTIPS["ardop.host"]), 0, wx.EXPAND | wx.ALL, 6)
 
@@ -297,6 +436,72 @@ class ConfigEditorDialog(wx.Dialog):
 
         panel.SetSizer(vs)
         self.nb.AddPage(panel, "ARDOP")
+
+    def _build_tcp_mesh_tab(self) -> None:
+        panel = wx.Panel(self.nb)
+        vs = wx.BoxSizer(wx.VERTICAL)
+
+        server_label = wx.StaticText(panel, label="TCP mesh server")
+        server_label.SetToolTip(TOOLTIPS["tcp_mesh.server"])
+        vs.Add(server_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 6)
+
+        server_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "")
+        server_box.GetStaticBox().SetToolTip(TOOLTIPS["tcp_mesh.server"])
+
+        self.tcp_server_enabled = wx.CheckBox(server_box.GetStaticBox(), label="Enable server")
+        self.tcp_server_enabled.SetValue(bool(_deep_get(self.data, "tcp_mesh.server.enabled", False)))
+        self.tcp_server_enabled.SetToolTip(TOOLTIPS["tcp_mesh.server.enabled"])
+        server_box.Add(self.tcp_server_enabled, 0, wx.ALL, 6)
+
+        self.tcp_server_port = wx.SpinCtrl(server_box.GetStaticBox(), min=1, max=65535,
+                                           initial=int(_deep_get(self.data, "tcp_mesh.server.server_port", 9000)))
+        server_box.Add(self._make_labeled(server_box.GetStaticBox(), "Server port", self.tcp_server_port,
+                                          TOOLTIPS["tcp_mesh.server.server_port"]), 0, wx.EXPAND | wx.ALL, 6)
+
+        self.tcp_server_pw = wx.TextCtrl(server_box.GetStaticBox(), style=wx.TE_PASSWORD,
+                                         value=str(_deep_get(self.data, "tcp_mesh.server.server_pw", "")))
+        server_box.Add(self._make_labeled(server_box.GetStaticBox(), "Server password", self.tcp_server_pw,
+                                          TOOLTIPS["tcp_mesh.server.server_pw"]), 0, wx.EXPAND | wx.ALL, 6)
+
+        vs.Add(server_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+
+        links_label = wx.StaticText(panel, label="TCP mesh client links")
+        links_label.SetToolTip(TOOLTIPS["tcp_mesh.links"])
+        vs.Add(links_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 6)
+
+        hs = wx.BoxSizer(wx.HORIZONTAL)
+
+        self.tcp_links_list = wx.ListCtrl(panel, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+        self.tcp_links_list.InsertColumn(0, "Name", width=160)
+        self.tcp_links_list.InsertColumn(1, "Enabled", width=80)
+        self.tcp_links_list.InsertColumn(2, "Host", width=180)
+        self.tcp_links_list.InsertColumn(3, "Port", width=80)
+        self.tcp_links_list.InsertColumn(4, "Password", width=120)
+        self.tcp_links_list.InsertColumn(5, "Base", width=70)
+        self.tcp_links_list.InsertColumn(6, "Max", width=70)
+        self.tcp_links_list.InsertColumn(7, "TXQ", width=80)
+        self.tcp_links_list.SetToolTip(TOOLTIPS["tcp_mesh.links"])
+        hs.Add(self.tcp_links_list, 1, wx.EXPAND | wx.ALL, 6)
+
+        btns = wx.BoxSizer(wx.VERTICAL)
+        self.btn_add_tcp_link = wx.Button(panel, label="Add…")
+        self.btn_edit_tcp_link = wx.Button(panel, label="Edit…")
+        self.btn_remove_tcp_link = wx.Button(panel, label="Remove")
+        btns.Add(self.btn_add_tcp_link, 0, wx.EXPAND | wx.BOTTOM, 6)
+        btns.Add(self.btn_edit_tcp_link, 0, wx.EXPAND | wx.BOTTOM, 6)
+        btns.Add(self.btn_remove_tcp_link, 0, wx.EXPAND)
+        hs.Add(btns, 0, wx.TOP | wx.RIGHT | wx.BOTTOM, 6)
+
+        vs.Add(hs, 1, wx.EXPAND)
+
+        self.btn_add_tcp_link.Bind(wx.EVT_BUTTON, self._on_add_tcp_link)
+        self.btn_edit_tcp_link.Bind(wx.EVT_BUTTON, self._on_edit_tcp_link)
+        self.btn_remove_tcp_link.Bind(wx.EVT_BUTTON, self._on_remove_tcp_link)
+
+        self._load_tcp_links_into_list()
+
+        panel.SetSizer(vs)
+        self.nb.AddPage(panel, "TCP Mesh")
 
     def _build_routing_tab(self) -> None:
         panel = wx.Panel(self.nb)
@@ -526,35 +731,48 @@ class ConfigEditorDialog(wx.Dialog):
         colors_box.GetStaticBox().SetToolTip(TOOLTIPS["gui.colors"])
 
         self.gui_window_bg = self._color_ctrl(panel, _deep_get(self.data, "gui.colors.window_bg", None))
-        colors_box.Add(self._make_labeled(panel, "Window background", self.gui_window_bg, TOOLTIPS["gui.colors.window_bg"]), 0, wx.EXPAND | wx.ALL, 6)
+        colors_box.Add(
+            self._make_labeled(panel, "Window background", self.gui_window_bg, TOOLTIPS["gui.colors.window_bg"]), 0,
+            wx.EXPAND | wx.ALL, 6)
 
         self.gui_chat_bg = self._color_ctrl(panel, _deep_get(self.data, "gui.colors.chat_bg", None))
-        colors_box.Add(self._make_labeled(panel, "Chat background", self.gui_chat_bg, TOOLTIPS["gui.colors.chat_bg"]), 0, wx.EXPAND | wx.ALL, 6)
+        colors_box.Add(self._make_labeled(panel, "Chat background", self.gui_chat_bg, TOOLTIPS["gui.colors.chat_bg"]),
+                       0, wx.EXPAND | wx.ALL, 6)
 
         self.gui_chat_fg = self._color_ctrl(panel, _deep_get(self.data, "gui.colors.chat_fg", None))
-        colors_box.Add(self._make_labeled(panel, "Chat text", self.gui_chat_fg, TOOLTIPS["gui.colors.chat_fg"]), 0, wx.EXPAND | wx.ALL, 6)
+        colors_box.Add(self._make_labeled(panel, "Chat text", self.gui_chat_fg, TOOLTIPS["gui.colors.chat_fg"]), 0,
+                       wx.EXPAND | wx.ALL, 6)
 
         self.gui_input_bg = self._color_ctrl(panel, _deep_get(self.data, "gui.colors.input_bg", None))
-        colors_box.Add(self._make_labeled(panel, "Input background", self.gui_input_bg, TOOLTIPS["gui.colors.input_bg"]), 0, wx.EXPAND | wx.ALL, 6)
+        colors_box.Add(
+            self._make_labeled(panel, "Input background", self.gui_input_bg, TOOLTIPS["gui.colors.input_bg"]), 0,
+            wx.EXPAND | wx.ALL, 6)
 
         self.gui_input_fg = self._color_ctrl(panel, _deep_get(self.data, "gui.colors.input_fg", None))
-        colors_box.Add(self._make_labeled(panel, "Input text", self.gui_input_fg, TOOLTIPS["gui.colors.input_fg"]), 0, wx.EXPAND | wx.ALL, 6)
+        colors_box.Add(self._make_labeled(panel, "Input text", self.gui_input_fg, TOOLTIPS["gui.colors.input_fg"]), 0,
+                       wx.EXPAND | wx.ALL, 6)
 
         self.gui_list_bg = self._color_ctrl(panel, _deep_get(self.data, "gui.colors.list_bg", None))
-        colors_box.Add(self._make_labeled(panel, "List background", self.gui_list_bg, TOOLTIPS["gui.colors.list_bg"]), 0, wx.EXPAND | wx.ALL, 6)
+        colors_box.Add(self._make_labeled(panel, "List background", self.gui_list_bg, TOOLTIPS["gui.colors.list_bg"]),
+                       0, wx.EXPAND | wx.ALL, 6)
 
         self.gui_list_fg = self._color_ctrl(panel, _deep_get(self.data, "gui.colors.list_fg", None))
-        colors_box.Add(self._make_labeled(panel, "List text", self.gui_list_fg, TOOLTIPS["gui.colors.list_fg"]), 0, wx.EXPAND | wx.ALL, 6)
+        colors_box.Add(self._make_labeled(panel, "List text", self.gui_list_fg, TOOLTIPS["gui.colors.list_fg"]), 0,
+                       wx.EXPAND | wx.ALL, 6)
 
         # Sender highlight colors
         self.gui_me = self._color_ctrl(panel, _deep_get(self.data, "gui.colors.me", None))
-        colors_box.Add(self._make_labeled(panel, "Highlight: me", self.gui_me, TOOLTIPS["gui.colors.me"]), 0, wx.EXPAND | wx.ALL, 6)
+        colors_box.Add(self._make_labeled(panel, "Highlight: me", self.gui_me, TOOLTIPS["gui.colors.me"]), 0,
+                       wx.EXPAND | wx.ALL, 6)
 
         self.gui_known = self._color_ctrl(panel, _deep_get(self.data, "gui.colors.known", None))
-        colors_box.Add(self._make_labeled(panel, "Highlight: known", self.gui_known, TOOLTIPS["gui.colors.known"]), 0, wx.EXPAND | wx.ALL, 6)
+        colors_box.Add(self._make_labeled(panel, "Highlight: known", self.gui_known, TOOLTIPS["gui.colors.known"]), 0,
+                       wx.EXPAND | wx.ALL, 6)
 
         self.gui_unknown = self._color_ctrl(panel, _deep_get(self.data, "gui.colors.unknown", None))
-        colors_box.Add(self._make_labeled(panel, "Highlight: unknown", self.gui_unknown, TOOLTIPS["gui.colors.unknown"]), 0, wx.EXPAND | wx.ALL, 6)
+        colors_box.Add(
+            self._make_labeled(panel, "Highlight: unknown", self.gui_unknown, TOOLTIPS["gui.colors.unknown"]), 0,
+            wx.EXPAND | wx.ALL, 6)
 
         vs.Add(colors_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
 
@@ -565,14 +783,20 @@ class ConfigEditorDialog(wx.Dialog):
         fonts_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "")
         fonts_box.GetStaticBox().SetToolTip(TOOLTIPS["gui.font_sizes"])
 
-        self.gui_font_chat = wx.SpinCtrl(panel, min=6, max=48, initial=int(_deep_get(self.data, "gui.font_sizes.chat", 10)))
-        fonts_box.Add(self._make_labeled(panel, "Chat", self.gui_font_chat, TOOLTIPS["gui.font_sizes.chat"]), 0, wx.EXPAND | wx.ALL, 6)
+        self.gui_font_chat = wx.SpinCtrl(panel, min=6, max=48,
+                                         initial=int(_deep_get(self.data, "gui.font_sizes.chat", 10)))
+        fonts_box.Add(self._make_labeled(panel, "Chat", self.gui_font_chat, TOOLTIPS["gui.font_sizes.chat"]), 0,
+                      wx.EXPAND | wx.ALL, 6)
 
-        self.gui_font_input = wx.SpinCtrl(panel, min=6, max=48, initial=int(_deep_get(self.data, "gui.font_sizes.input", 10)))
-        fonts_box.Add(self._make_labeled(panel, "Input", self.gui_font_input, TOOLTIPS["gui.font_sizes.input"]), 0, wx.EXPAND | wx.ALL, 6)
+        self.gui_font_input = wx.SpinCtrl(panel, min=6, max=48,
+                                          initial=int(_deep_get(self.data, "gui.font_sizes.input", 10)))
+        fonts_box.Add(self._make_labeled(panel, "Input", self.gui_font_input, TOOLTIPS["gui.font_sizes.input"]), 0,
+                      wx.EXPAND | wx.ALL, 6)
 
-        self.gui_font_list = wx.SpinCtrl(panel, min=6, max=48, initial=int(_deep_get(self.data, "gui.font_sizes.list", 10)))
-        fonts_box.Add(self._make_labeled(panel, "List", self.gui_font_list, TOOLTIPS["gui.font_sizes.list"]), 0, wx.EXPAND | wx.ALL, 6)
+        self.gui_font_list = wx.SpinCtrl(panel, min=6, max=48,
+                                         initial=int(_deep_get(self.data, "gui.font_sizes.list", 10)))
+        fonts_box.Add(self._make_labeled(panel, "List", self.gui_font_list, TOOLTIPS["gui.font_sizes.list"]), 0,
+                      wx.EXPAND | wx.ALL, 6)
 
         vs.Add(fonts_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
 
@@ -655,6 +879,138 @@ class ConfigEditorDialog(wx.Dialog):
             _deep_set(self.data, "chat.peers", peers)
         self._load_peers_into_list()
 
+    # ----------------------------------------------------------
+    # TCP link list helpers
+    # ----------------------------------------------------------
+
+    def _load_tcp_links_into_list(self) -> None:
+        self.tcp_links_list.DeleteAllItems()
+        links = _deep_get(self.data, "tcp_mesh.links", []) or []
+        if not isinstance(links, list):
+            links = []
+
+        for i, entry in enumerate(links):
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name", f"link-{i}") or f"link-{i}")
+            enabled = "yes" if bool(entry.get("enabled", True)) else "no"
+            host = str(entry.get("host", "") or "")
+            port = str(entry.get("port", "") or "")
+            pw = str(entry.get("password", "") or "")
+            base = str(entry.get("reconnect_base_delay", "") or "")
+            maxd = str(entry.get("reconnect_max_delay", "") or "")
+            txq = str(entry.get("tx_queue_size", "") or "")
+
+            idx = self.tcp_links_list.InsertItem(self.tcp_links_list.GetItemCount(), name)
+            self.tcp_links_list.SetItem(idx, 1, enabled)
+            self.tcp_links_list.SetItem(idx, 2, host)
+            self.tcp_links_list.SetItem(idx, 3, port)
+            self.tcp_links_list.SetItem(idx, 4, "*" * len(pw) if pw else "")
+            self.tcp_links_list.SetItem(idx, 5, base)
+            self.tcp_links_list.SetItem(idx, 6, maxd)
+            self.tcp_links_list.SetItem(idx, 7, txq)
+
+    def _get_selected_tcp_link_index(self) -> Optional[int]:
+        idx = self.tcp_links_list.GetFirstSelected()
+        if idx == -1:
+            return None
+        return int(idx)
+
+    def _on_add_tcp_link(self, _event: wx.CommandEvent) -> None:
+        dlg = TcpLinkEditDialog(self, "Add TCP Link")
+        try:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            row = dlg.get_link()
+        finally:
+            dlg.Destroy()
+
+        links = _deep_get(self.data, "tcp_mesh.links", []) or []
+        if not isinstance(links, list):
+            links = []
+
+        links.append({
+            "name": row.name,
+            "enabled": bool(row.enabled),
+            "host": row.host,
+            "port": int(row.port),
+            "password": row.password,
+            "reconnect_base_delay": float(row.reconnect_base_delay),
+            "reconnect_max_delay": float(row.reconnect_max_delay),
+            "tx_queue_size": int(row.tx_queue_size),
+        })
+        _deep_set(self.data, "tcp_mesh.links", links)
+        self._load_tcp_links_into_list()
+
+    def _on_edit_tcp_link(self, _event: wx.CommandEvent) -> None:
+        sel = self._get_selected_tcp_link_index()
+        if sel is None:
+            return
+
+        links = _deep_get(self.data, "tcp_mesh.links", []) or []
+        if not isinstance(links, list) or sel < 0 or sel >= len(links):
+            return
+        entry = links[sel]
+        if not isinstance(entry, dict):
+            return
+
+        initial = TcpLinkRow(
+            name=str(entry.get("name", f"link-{sel}") or f"link-{sel}"),
+            enabled=bool(entry.get("enabled", True)),
+            host=str(entry.get("host", "") or ""),
+            port=int(entry.get("port", 9000) or 9000),
+            password=str(entry.get("password", "") or ""),
+            reconnect_base_delay=float(entry.get("reconnect_base_delay", 5.0) or 5.0),
+            reconnect_max_delay=float(entry.get("reconnect_max_delay", 60.0) or 60.0),
+            tx_queue_size=int(entry.get("tx_queue_size", 1000) or 1000),
+        )
+
+        dlg = TcpLinkEditDialog(self, "Edit TCP Link", initial=initial)
+        try:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            row = dlg.get_link()
+        finally:
+            dlg.Destroy()
+
+        links[sel] = {
+            "name": row.name,
+            "enabled": bool(row.enabled),
+            "host": row.host,
+            "port": int(row.port),
+            "password": row.password,
+            "reconnect_base_delay": float(row.reconnect_base_delay),
+            "reconnect_max_delay": float(row.reconnect_max_delay),
+            "tx_queue_size": int(row.tx_queue_size),
+        }
+        _deep_set(self.data, "tcp_mesh.links", links)
+        self._load_tcp_links_into_list()
+
+    def _on_remove_tcp_link(self, _event: wx.CommandEvent) -> None:
+        sel = self._get_selected_tcp_link_index()
+        if sel is None:
+            return
+
+        links = _deep_get(self.data, "tcp_mesh.links", []) or []
+        if not isinstance(links, list) or sel < 0 or sel >= len(links):
+            return
+
+        name = ""
+        entry = links[sel]
+        if isinstance(entry, dict):
+            name = str(entry.get("name", "") or "")
+
+        if wx.MessageBox(
+                f"Remove TCP link '{name}'?",
+                "Confirm",
+                wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION,
+        ) != wx.YES:
+            return
+
+        del links[sel]
+        _deep_set(self.data, "tcp_mesh.links", links)
+        self._load_tcp_links_into_list()
+
     @staticmethod
     def _parse_float(label: str, ctrl: wx.TextCtrl) -> Optional[float]:
         raw = ctrl.GetValue().strip()
@@ -667,7 +1023,7 @@ class ConfigEditorDialog(wx.Dialog):
             wx.MessageBox(f"{label} must be a number.", "Validation", wx.ICON_WARNING)
             return None
 
-    def _on_ok(self, event: wx.CommandEvent) -> None:
+    def _on_ok(self, _event: wx.CommandEvent) -> None:
         callsign = self.callsign.GetValue().strip()
         mesh_dest = self.mesh_dest.GetValue().strip()
         if not callsign or not mesh_dest:
@@ -702,11 +1058,17 @@ class ConfigEditorDialog(wx.Dialog):
         _deep_set(self.data, "mesh.callsign", callsign)
         _deep_set(self.data, "mesh.mesh_dest_callsign", mesh_dest)
 
+        _deep_set(self.data, "ardop.enabled", bool(self.ardop_enabled.GetValue()))
+
         _deep_set(self.data, "ardop.host", self.ardop_host.GetValue().strip())
         _deep_set(self.data, "ardop.port", int(self.ardop_port.GetValue()))
         _deep_set(self.data, "ardop.reconnect_base_delay", float(reconnect_base))
         _deep_set(self.data, "ardop.reconnect_max_delay", float(reconnect_max))
         _deep_set(self.data, "ardop.tx_queue_size", int(self.tx_queue.GetValue()))
+
+        _deep_set(self.data, "tcp_mesh.server.enabled", bool(self.tcp_server_enabled.GetValue()))
+        _deep_set(self.data, "tcp_mesh.server.server_pw", self.tcp_server_pw.GetValue())
+        _deep_set(self.data, "tcp_mesh.server.server_port", int(self.tcp_server_port.GetValue()))
 
         _deep_set(self.data, "routing.ogm_interval_seconds", float(ogm_interval))
         _deep_set(self.data, "routing.ogm_ttl", int(self.ogm_ttl.GetValue()))
@@ -757,7 +1119,7 @@ class ConfigEditorDialog(wx.Dialog):
             wx.MessageBox(f"Failed to save config:\n{e}", "Error", wx.ICON_ERROR)
             return
 
-        event.Skip()
+        self.EndModal(wx.ID_OK)
 
 
 def open_config_editor(parent: wx.Window, config_path: str) -> bool:

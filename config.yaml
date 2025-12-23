@@ -2,6 +2,7 @@ mesh:
   callsign: KD9YQK-1
   mesh_dest_callsign: QMESH-0
 ardop:
+  enabled: false
   host: 127.0.0.1
   port: 8515
   reconnect_base_delay: 5.0
@@ -52,3 +53,17 @@ gui:
     chat: 10
     input: 10
     list: 14
+tcp_mesh:
+  server:
+    enabled: true
+    server_pw: password
+    server_port: 9000
+  links:
+  - name: loopback-test
+    enabled: false
+    host: 127.0.0.1
+    port: 9000
+    password: example-password
+    reconnect_base_delay: 5.0
+    reconnect_max_delay: 60.0
+    tx_queue_size: 1000
