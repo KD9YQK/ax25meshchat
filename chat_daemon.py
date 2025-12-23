@@ -72,6 +72,12 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Override chat.db_path from config.yaml (absolute or relative to config dir)",
     )
     ap.add_argument(
+        "--mode",
+        choices=["full", "relay", "monitor"],
+        default="",
+        help="Override chat.node_mode (full|relay|monitor)",
+    )
+    ap.add_argument(
         "-v",
         "--verbose",
         action="count",
@@ -87,6 +93,10 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     config_path = Path(str(args.config)).expanduser().resolve()
     chat_config = load_chat_config_from_yaml(str(config_path))
+
+    mode_override = str(getattr(args, "mode", "") or "").strip().lower()
+    if mode_override:
+        chat_config.node_mode = mode_override
 
     # Optional overrides (additive, no schema changes)
     callsign = str(args.callsign or "").strip()

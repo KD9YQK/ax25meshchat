@@ -9,11 +9,14 @@ This script runs the existing mesh chat backend without any GUI and without any 
 When running, the daemon:
 
 - Participates as a normal mesh node (OGMs, forwarding, dedup, ordering)
-- Receives and stores chat messages in the existing SQLite database
-- Performs gap detection and recovery (including targeted/range sync if enabled in config)
-- Responds to sync requests from peers
 - Logs activity to **stdout**
 - Runs indefinitely until terminated (SIGINT/SIGTERM), then shuts down cleanly
+
+Depending on `--mode` / `chat.node_mode`, it may also:
+
+- Receive and store chat messages in the existing SQLite database (full mode only)
+- Perform gap detection and recovery (including targeted/range sync if enabled in config) (full mode only)
+- Respond to sync requests from peers (full mode only)
 
 ## Requirements
 
@@ -24,7 +27,7 @@ When running, the daemon:
 ## Usage
 
 ```bash
-python3 chat_daemon.py [--config PATH] [--callsign CALLSIGN] [--db-path PATH] [-v|-vv]
+python3 chat_daemon.py [--config PATH] [--callsign CALLSIGN] [--db-path PATH] [--mode MODE] [-v|-vv]
 ```
 
 ### Command-line options
@@ -39,6 +42,14 @@ python3 chat_daemon.py [--config PATH] [--callsign CALLSIGN] [--db-path PATH] [-
   Overrides `chat.db_path` from the YAML **at runtime**.
   - If the path is relative, it is resolved relative to the config file directory.
   - If the path is absolute, it is used as-is.
+
+- `--mode MODE`  
+  Selects the node mode (role). Valid values:
+  - `full` (default) → normal chat participant behavior (store + sync enabled as configured)
+  - `relay` → forwards mesh traffic, but does **not** originate chat, does **not** store chat, and does **not** participate in sync
+  - `monitor` → diagnostics/logging focused; does **not** originate chat, does **not** store chat, and does **not** participate in sync
+
+  If omitted, the daemon uses `chat.node_mode` from the YAML. If the YAML also omits it, the default is `full`.
 
 - `-v`, `-vv`  
   Logging verbosity:
@@ -89,6 +100,29 @@ python3 chat_daemon.py --callsign GATE-VHF --db-path ./vhf.sqlite
 ```bash
 python3 chat_daemon.py -vv
 ```
+
+### 8) Run as a headless relay / repeater node (no chat DB, no sync)
+
+```bash
+python3 chat_daemon.py --mode relay
+```
+
+### 9) Run as a passive monitor / diagnostics node (no chat DB, no sync)
+
+```bash
+python3 chat_daemon.py --mode monitor
+```
+
+## Config example (YAML)
+
+You can also set the default mode in `config.yaml`:
+
+```yaml
+chat:
+  node_mode: relay  # full | relay | monitor
+```
+
+The command line `--mode` overrides this YAML value at runtime.
 
 ## Running multiple instances (same host)
 

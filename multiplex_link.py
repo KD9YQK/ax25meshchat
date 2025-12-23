@@ -33,3 +33,30 @@ class MultiplexLinkClient:
     def send(self, payload: bytes) -> None:
         for link in self._links:
             link.send(payload)
+
+    def get_metrics(self) -> dict:
+        # Aggregate metrics from underlying links if available.
+        items = []
+        any_connected = False
+        any_running = False
+        for link in self._links:
+            gm = getattr(link, "get_metrics", None)
+            if callable(gm):
+                m = gm()
+                items.append(m)
+                if bool(m.get("connected")):
+                    any_connected = True
+                if bool(m.get("running")):
+                    any_running = True
+            else:
+                # Minimal fallback
+                items.append({"name": getattr(link, "_name", "link"), "connected": False, "running": True})
+
+        return {
+            "name": "multiplex",
+            "link_type": "multiplex",
+            "running": any_running,
+            "connected": any_connected,
+            "links": items,
+        }
+

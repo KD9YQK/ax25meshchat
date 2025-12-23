@@ -28,7 +28,7 @@ import queue
 import socket
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Callable, Optional
 
 LOG = logging.getLogger(__name__)
@@ -42,6 +42,39 @@ _HS_BAD_HANDSHAKE = b"\x02"
 
 class TcpLinkError(Exception):
     pass
+
+
+@dataclass
+class LinkMetrics:
+    name: str
+    link_type: str  # "tcp"
+    mode: str       # "client" or "server"
+    running: bool
+    connected: bool
+
+    started_ts: float = 0.0
+    last_connect_ts: float = 0.0
+    last_disconnect_ts: float = 0.0
+    last_rx_ts: float = 0.0
+    last_tx_ts: float = 0.0
+
+    rx_frames: int = 0
+    tx_frames: int = 0
+    rx_bytes: int = 0
+    tx_bytes: int = 0
+
+    connect_attempts: int = 0
+    connect_successes: int = 0
+    disconnects: int = 0
+    handshake_failures: int = 0
+    tx_dropped_no_conn: int = 0
+    tx_dropped_q_full: int = 0
+    tx_errors: int = 0
+    rx_errors: int = 0
+    last_error: str = ""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -106,6 +139,15 @@ class TcpLinkClient:
         self._rx_buffer = bytearray()
         self._lock = threading.Lock()
 
+        mode = "server" if self._server_cfg is not None else "client"
+        self._metrics = LinkMetrics(
+            name=str(self._name),
+            link_type="tcp",
+            mode=mode,
+            running=False,
+            connected=False,
+        )
+
     @classmethod
     def client(
             cls,
@@ -160,6 +202,8 @@ class TcpLinkClient:
         if self._running.is_set():
             return
         self._running.set()
+        self._metrics.running = True
+        self._metrics.started_ts = time.time()
 
         if self._server_cfg is not None:
             LOG.info("%s starting in SERVER mode on port %d", self._name, self._server_cfg.port)
@@ -184,6 +228,7 @@ class TcpLinkClient:
             return
 
         self._running.clear()
+        self._metrics.running = False
 
         try:
             self._tx_queue.put_nowait(b"")
@@ -209,6 +254,10 @@ class TcpLinkClient:
                     LOG.warning("Error closing TCP server socket", exc_info=True)
                 self._srv_sock = None
             self._connected.clear()
+            if self._metrics.connected:
+                self._metrics.connected = False
+                self._metrics.last_disconnect_ts = time.time()
+                self._metrics.disconnects += 1
 
     def send(self, payload: bytes) -> None:
         if not self._running.is_set():
@@ -221,7 +270,17 @@ class TcpLinkClient:
             self._tx_queue.put_nowait(bytes(payload))
         except queue.Full:
             # Drop rather than block the mesh node
+            self._metrics.tx_dropped_q_full += 1
             return
+
+    def is_connected(self) -> bool:
+        return self._connected.is_set()
+
+    def get_metrics(self) -> dict:
+        with self._lock:
+            self._metrics.connected = self._connected.is_set()
+            self._metrics.running = self._running.is_set()
+            return dict(self._metrics.to_dict())
 
     # ------------------------------------------------------------------
     # Connection management + handshake
@@ -235,6 +294,7 @@ class TcpLinkClient:
 
         while self._running.is_set() and not self._connected.is_set():
             try:
+                self._metrics.connect_attempts += 1
                 LOG.info("%s connecting to %s:%d", self._name, self._client_cfg.host, self._client_cfg.port)
                 sock = socket.create_connection((self._client_cfg.host, self._client_cfg.port), timeout=10.0)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -251,10 +311,16 @@ class TcpLinkClient:
                     self._sock = sock
                     self._rx_buffer.clear()
                     self._connected.set()
+                    self._metrics.connected = True
+                    self._metrics.last_connect_ts = time.time()
+                    self._metrics.connect_successes += 1
+                    self._metrics.last_error = ""
                 LOG.info("%s connected to %s:%d", self._name, self._client_cfg.host, self._client_cfg.port)
                 return
             except TcpLinkError as exc:
                 # Bad password / handshake: do not retry forever.
+                self._metrics.handshake_failures += 1
+                self._metrics.last_error = "handshake_failed"
                 LOG.error("%s handshake failed: %s (stopping)", self._name, exc)
                 self.stop()
                 return
@@ -285,11 +351,14 @@ class TcpLinkClient:
 
         while self._running.is_set() and not self._connected.is_set():
             try:
+                self._metrics.connect_attempts += 1
                 conn, addr = self._srv_sock.accept()
                 conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 conn.settimeout(5.0)
 
                 if not self._server_handshake(conn, self._server_cfg.server_pw):
+                    self._metrics.handshake_failures += 1
+                    self._metrics.last_error = "handshake_rejected"
                     LOG.warning("%s rejected connection (bad password or handshake)", self._name)
                     try:
                         conn.close()
@@ -308,6 +377,10 @@ class TcpLinkClient:
                     self._sock = conn
                     self._rx_buffer.clear()
                     self._connected.set()
+                    self._metrics.connected = True
+                    self._metrics.last_connect_ts = time.time()
+                    self._metrics.connect_successes += 1
+                    self._metrics.last_error = ""
                 LOG.info("%s accepted %s", self._name, addr)
                 return
             except socket.timeout:
@@ -404,6 +477,8 @@ class TcpLinkClient:
             except socket.timeout:
                 continue
             except OSError:
+                self._metrics.tx_errors += 1
+                self._metrics.last_error = "tx_error"
                 self._drop_connection()
 
     def _drain_rx_buffer(self) -> None:
@@ -420,9 +495,15 @@ class TcpLinkClient:
             frame = bytes(self._rx_buffer[2:2 + frame_len])
             del self._rx_buffer[:2 + frame_len]
 
+            self._metrics.rx_frames += 1
+            self._metrics.rx_bytes += int(frame_len)
+            self._metrics.last_rx_ts = time.time()
+
             try:
                 self._rx_callback(frame)
             except (ValueError, OSError):
+                self._metrics.rx_errors += 1
+                self._metrics.last_error = "rx_callback_error"
                 continue
 
     def _tx_loop(self) -> None:
@@ -436,6 +517,7 @@ class TcpLinkClient:
                 continue
 
             if not self._connected.is_set():
+                self._metrics.tx_dropped_no_conn += 1
                 continue
 
             with self._lock:
@@ -449,11 +531,20 @@ class TcpLinkClient:
                 if len(payload) > 65535:
                     continue
                 sock.sendall(len(payload).to_bytes(2, "big") + payload)
+                self._metrics.tx_frames += 1
+                self._metrics.tx_bytes += int(len(payload))
+                self._metrics.last_tx_ts = time.time()
             except OSError:
+                self._metrics.rx_errors += 1
+                self._metrics.last_error = "rx_error"
                 self._drop_connection()
 
     def _drop_connection(self) -> None:
         LOG.warning("%s connection dropped", self._name)
+        if self._metrics.connected:
+            self._metrics.connected = False
+            self._metrics.last_disconnect_ts = time.time()
+            self._metrics.disconnects += 1
         with self._lock:
             if self._sock is not None:
                 try:

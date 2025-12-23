@@ -66,6 +66,7 @@ TOOLTIPS: Dict[str, str] = {
     "security.key_hex": "Hex-encoded key material used by your crypto layer (leave null/blank when encryption is disabled).",
 
     "chat.db_path": "Path to the SQLite chat log database (relative paths resolve from the working directory).",
+    "chat.node_mode": "Role-based node behavior. full=normal chat node; relay=mesh forwarder with chat/sync disabled; monitor=diagnostics-only (no chat/sync).",
 
     "chat.sync": "Settings for message history synchronization between nodes.",
     "chat.sync.enabled": "Master toggle for sync logic. If false, the client will not request or respond with history sync data.",
@@ -561,6 +562,17 @@ class ConfigEditorDialog(wx.Dialog):
 
         self.db_path = wx.TextCtrl(panel, value=str(_deep_get(self.data, "chat.db_path", "chat_logs.sqlite")))
         vs.Add(self._make_labeled(panel, "DB path", self.db_path, TOOLTIPS["chat.db_path"]), 0, wx.EXPAND | wx.ALL, 6)
+
+        # Node mode (Feature #3: Role-based node modes)
+        mode_val = str(_deep_get(self.data, "chat.node_mode", "full") or "full").strip().lower()
+        self.node_mode = wx.Choice(panel, choices=["full", "relay", "monitor"])
+        self.node_mode.SetToolTip(TOOLTIPS["chat.node_mode"])
+        if mode_val in ("full", "relay", "monitor"):
+            self.node_mode.SetStringSelection(mode_val)
+        else:
+            self.node_mode.SetStringSelection("full")
+        vs.Add(self._make_labeled(panel, "Node mode", self.node_mode, TOOLTIPS["chat.node_mode"]), 0,
+               wx.EXPAND | wx.ALL, 6)
 
         # -----------------------
         # Sync options
@@ -1096,6 +1108,9 @@ class ConfigEditorDialog(wx.Dialog):
         )
 
         _deep_set(self.data, "chat.db_path", self.db_path.GetValue().strip())
+
+        # chat.node_mode (Feature #3)
+        _deep_set(self.data, "chat.node_mode", str(self.node_mode.GetStringSelection() or "full").strip().lower())
 
         # gui theme
         _deep_set(self.data, "gui.colors.window_bg", self._color_to_hex(self.gui_window_bg.GetColour()))

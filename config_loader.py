@@ -277,6 +277,11 @@ def load_chat_config_from_yaml(path: str) -> MeshChatConfig:
     raw_db_path = str(_get_required(chat_cfg_raw, "db_path"))
     db_path = str(Path(path).parent.joinpath(raw_db_path).resolve())
 
+    # ---- node mode (optional; Feature #3) ----
+    node_mode = str(chat_cfg_raw.get("node_mode", "full") or "full").strip().lower()
+    if node_mode not in {"full", "relay", "monitor"}:
+        raise ValueError("chat.node_mode must be one of: full, relay, monitor")
+
     # ---- sync config (optional) ----
     sync_any = chat_cfg_raw.get("sync", {})
     if not isinstance(sync_any, dict):
@@ -348,6 +353,7 @@ def load_chat_config_from_yaml(path: str) -> MeshChatConfig:
         mesh_node_config=mesh_node_cfg,
         db_path=db_path,
         peers=peers,
+        node_mode=node_mode,
         sync_enabled=sync_enabled,
         sync_last_n_messages=sync_last_n_messages,
         sync_max_send_per_response=sync_max_send_per_response,

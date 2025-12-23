@@ -20,6 +20,8 @@ body) with no AX.25 or KISS framing.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, asdict
+
 import logging
 import queue
 import socket
@@ -31,6 +33,36 @@ from mesh_config import ArdopConnectionConfig
 
 
 LOG = logging.getLogger(__name__)
+
+
+@dataclass
+class LinkMetrics:
+    name: str
+    link_type: str
+    running: bool
+    connected: bool
+
+    started_ts: float = 0.0
+    last_connect_ts: float = 0.0
+    last_disconnect_ts: float = 0.0
+    last_rx_ts: float = 0.0
+    last_tx_ts: float = 0.0
+
+    rx_frames: int = 0
+    tx_frames: int = 0
+    rx_bytes: int = 0
+    tx_bytes: int = 0
+
+    connect_attempts: int = 0
+    connect_successes: int = 0
+    disconnects: int = 0
+    tx_dropped_no_conn: int = 0
+    tx_errors: int = 0
+    rx_errors: int = 0
+    last_error: str = ""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
 class ArdopLinkError(Exception):
@@ -79,6 +111,13 @@ class ArdopLinkClient:
 
         self._lock = threading.Lock()
 
+        self._metrics = LinkMetrics(
+            name=str(self._name),
+            link_type="ardop",
+            running=False,
+            connected=False,
+        )
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -90,6 +129,8 @@ class ArdopLinkClient:
             return
 
         self._running.set()
+        self._metrics.running = True
+        self._metrics.started_ts = time.time()
 
         self._rx_thread = threading.Thread(
             target=self._rx_loop,
@@ -111,6 +152,7 @@ class ArdopLinkClient:
             return
 
         self._running.clear()
+        self._metrics.running = False
 
         # Wake TX thread so it can exit
         try:
@@ -131,6 +173,9 @@ class ArdopLinkClient:
                     LOG.warning("Error closing ARDOP socket", exc_info=True)
                 self._sock = None
                 self._connected.clear()
+                self._metrics.connected = False
+                self._metrics.last_disconnect_ts = time.time()
+                self._metrics.disconnects += 1
 
     def send(
         self,
@@ -165,6 +210,13 @@ class ArdopLinkClient:
     def is_connected(self) -> bool:
         return self._connected.is_set()
 
+    def get_metrics(self) -> dict:
+        # Snapshot metrics (thread-safe enough for approximate diagnostics)
+        with self._lock:
+            self._metrics.connected = self._connected.is_set()
+            self._metrics.running = self._running.is_set()
+            return dict(self._metrics.to_dict())
+
     # ------------------------------------------------------------------
     # Connection management
     # ------------------------------------------------------------------
@@ -175,6 +227,7 @@ class ArdopLinkClient:
 
         while self._running.is_set() and not self._connected.is_set():
             try:
+                self._metrics.connect_attempts += 1
                 LOG.info(
                     "Connecting ARDOP link to %s:%d",
                     self._config.host,
@@ -199,12 +252,17 @@ class ArdopLinkClient:
                     self._sock = sock
                     self._rx_buffer.clear()
                     self._connected.set()
+                    self._metrics.connected = True
+                    self._metrics.last_connect_ts = time.time()
+                    self._metrics.connect_successes += 1
+                    self._metrics.last_error = ""
 
                 LOG.info("ARDOP TCP connection established")
                 return
 
             except OSError:
                 self._connected.clear()
+                self._metrics.last_error = "connect_failed"
                 LOG.warning(
                     "ARDOP TCP connection failed; retrying in %.1f s",
                     delay,
@@ -246,6 +304,9 @@ class ArdopLinkClient:
                             pass
                         self._sock = None
                         self._connected.clear()
+                        self._metrics.connected = False
+                        self._metrics.last_disconnect_ts = time.time()
+                        self._metrics.disconnects += 1
                     time.sleep(1.0)
                     continue
 
@@ -264,6 +325,9 @@ class ArdopLinkClient:
                             pass
                         self._sock = None
                         self._connected.clear()
+                        self._metrics.connected = False
+                        self._metrics.last_disconnect_ts = time.time()
+                        self._metrics.disconnects += 1
                 time.sleep(1.0)
 
     def _tx_loop(self) -> None:
@@ -282,6 +346,7 @@ class ArdopLinkClient:
 
             if (not self._connected.is_set()) or (self._sock is None):
                 if (not self._connected.is_set()) or (self._sock is None):
+                    self._metrics.tx_dropped_no_conn += 1
                     LOG.warning("Dropping TX frame: no ARDOP TCP connection available")
                     continue
 
@@ -307,7 +372,14 @@ class ArdopLinkClient:
                         raise ArdopLinkError("Socket connection broken during send")
                     total_sent += sent
 
+                # Successful send
+                self._metrics.tx_frames += 1
+                self._metrics.tx_bytes += int(frame_len)
+                self._metrics.last_tx_ts = time.time()
+
             except (OSError, ArdopLinkError):
+                self._metrics.tx_errors += 1
+                self._metrics.last_error = "tx_error"
                 LOG.warning(
                     "Error writing ARDOP frame; dropping connection and retrying",
                     exc_info=True,
@@ -347,6 +419,10 @@ class ArdopLinkClient:
             end = 2 + frame_len
             frame = bytes(self._rx_buffer[start:end])
 
+            self._metrics.rx_frames += 1
+            self._metrics.rx_bytes += int(frame_len)
+            self._metrics.last_rx_ts = time.time()
+
             # Remove from buffer
             del self._rx_buffer[:end]
 
@@ -356,6 +432,8 @@ class ArdopLinkClient:
             except (ValueError, RuntimeError, ArdopLinkError):
                 # Expected "bad frame" / "cannot decode" style failures from consumers.
                 # We drop the frame and continue.
+                self._metrics.rx_errors += 1
+                self._metrics.last_error = "rx_callback_error"
                 LOG.warning(
                     "Error in ARDOP RX callback; frame dropped",
                     exc_info=True,
@@ -363,6 +441,7 @@ class ArdopLinkClient:
             except Exception:
                 # Any other exception is treated as a programming error in the consumer.
                 # Stop the link client rather than silently swallowing it in a tight loop.
+                self._metrics.last_error = "rx_callback_crash"
                 LOG.exception(
                     "Unhandled exception in ARDOP RX callback; stopping link client",
                 )

@@ -18,6 +18,7 @@ security:
   enable_encryption: false
   key_hex: null
 chat:
+  node_mode: full   # full or relay or monitor
   db_path: chat_logs.sqlite
   sync:
     enabled: true
@@ -55,15 +56,15 @@ gui:
     list: 14
 tcp_mesh:
   server:
-    enabled: true
-    server_pw: passworda
+    enabled: false
+    server_pw: password
     server_port: 9000
   links:
   - name: loopback-test
-    enabled: true
+    enabled: false
     host: 127.0.0.1
     port: 9000
-    password: passworda
+    password: password
     reconnect_base_delay: 5.0
     reconnect_max_delay: 60.0
     tx_queue_size: 1000

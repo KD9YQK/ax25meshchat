@@ -243,6 +243,101 @@ See: `chatlogs_export.md`
 
 ---
 
+## Recent Feature Additions
+
+The following features are **implemented and stable**. They improve observability and operational flexibility **without altering mesh protocol behavior**.
+
+### Feature #1 — Per-Link Metrics
+
+Each active link (ARDOP, TCP mesh, etc.) maintains independent health and performance metrics:
+
+- Bytes transmitted / received
+- Packet counts
+- Duplicate suppression statistics
+- Recent activity timestamps
+- Link uptime
+
+Metrics are tracked **per link**, not per node, allowing accurate diagnosis of asymmetric paths, RF degradation, or failing backbone links.
+
+These metrics:
+- Do **not** affect routing decisions
+- Do **not** alter protocol behavior
+- Are strictly observational
+
+They are surfaced through backend status events and structured diagnostics output.
+
+---
+
+### Feature #2 — Structured Diagnostics Output
+
+The backend emits **structured, machine-parseable diagnostics snapshots**.
+
+Characteristics:
+- Stable output format intended for logging and tooling
+- Includes:
+  - Node identity
+  - Discovered peers
+  - Routing state
+  - Per-link metrics
+  - Chat-layer state (queues, DB counts, sync status)
+- Emitted periodically and on key state transitions
+
+This enables:
+- Headless monitoring
+- External dashboards
+- Offline log analysis
+- Debugging without a GUI
+
+Diagnostics output is **read-only** and has no effect on mesh behavior.
+
+---
+
+### Feature #3 — Role-Based Node Modes
+
+Nodes can explicitly declare a **role** that controls how they participate in the mesh using existing mechanisms.
+
+Configured via:
+- `chat.node_mode` in `config.yaml`, or
+- `--mode` when running `chat_daemon.py`
+
+Supported modes:
+
+#### `full` (default)
+- Normal chat participant
+- Can originate chat messages
+- Stores chat history in SQLite
+- Fully participates in sync (gap detection, retries, targeted sync)
+
+This is the existing behavior and remains the default.
+
+#### `relay`
+- Mesh repeater / router
+- Participates in OGMs, routing, and forwarding
+- Does **not** originate chat messages
+- Does **not** store chat history
+- Does **not** participate in chat sync
+
+Intended for RF repeaters, bridge nodes, and infrastructure roles.
+
+#### `monitor`
+- Passive diagnostics / observation node
+- Participates in mesh discovery and forwarding
+- Emits diagnostics and link metrics
+- Does **not** originate chat
+- Does **not** store chat history
+- Does **not** participate in sync
+
+Useful for monitoring stations and network observation.
+
+**Important:**  
+Role-based modes introduce **no protocol changes**, **no routing changes**, and **no implicit behavior**.  
+If a mode is not explicitly set, node behavior is unchanged.
+
+---
+
+
+---
+
 ## Design Principles
 
 - RF-first, not IP-first
