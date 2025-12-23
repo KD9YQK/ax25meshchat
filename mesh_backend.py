@@ -387,9 +387,32 @@ class MeshChatBackend(BackendInterface):
                         "callsign": cs,
                         "node_id_hex": node_id_b.hex() if isinstance(node_id_b, (bytes, bytearray)) else "",
                         "last_seen_age_s": age_s,
+                        "peer_state": None,  # filled below (derived),
                     }
                 )
-            discovered_list.sort(key=lambda d: str(d.get("callsign") or ""))
+            discovered_list.sort(key=lambda item: str(item.get("callsign") or ""))
+            # Feature #5: derived peer reachability hint for diagnostics only (no behavior changes).
+            win = self._diagnostic_peer_window_s()
+            if isinstance(win, (int, float)) and float(win) > 0:
+                w = float(win)
+                for d in discovered_list:
+                    if not isinstance(d, dict):
+                        continue
+                    age = d.get('last_seen_age_s')
+                    if not isinstance(age, (int, float)):
+                        d['peer_state'] = 'unknown'
+                        continue
+                    a = float(age)
+                    if a <= w:
+                        d['peer_state'] = 'online'
+                    elif a <= (w * 2.0):
+                        d['peer_state'] = 'stale'
+                    else:
+                        d['peer_state'] = 'likely_offline'
+            else:
+                for d in discovered_list:
+                    if isinstance(d, dict):
+                        d['peer_state'] = 'unknown'
 
         # Per-link metrics (Feature #1)
         try:
@@ -418,7 +441,7 @@ class MeshChatBackend(BackendInterface):
                     "last_n": int(getattr(st, "last_n", 0) or 0),
                 }
             )
-        retries.sort(key=lambda d: (str(d.get("channel") or ""), str(d.get("peer_label") or "")))
+        retries.sort(key=lambda item: (str(item.get("channel") or ""), str(item.get("peer_label") or "")))
 
         # Local channels (from our cached view; derived from ChatStore via backend refresh)
         local_channels = list(self._last_channels) if isinstance(self._last_channels, list) else []
@@ -436,6 +459,7 @@ class MeshChatBackend(BackendInterface):
                 "neighbors_count": int(neighbors_count),
                 "discovered_count": int(len(discovered_list)),
                 "discovered_nodes": discovered_list[:25],  # cap for RF readability
+                "peer_freshness_window_s": self._diagnostic_peer_window_s(),
             },
             "links": link_metrics,
             "sync": {
@@ -840,6 +864,15 @@ class MeshChatBackend(BackendInterface):
                                                            last_n=last_n, reason="auto_peer_link_gate")
                             continue
 
+                        # Feature #5: peer-aware gate (derived; policy-only, no routing changes)
+                        allow_peer, reason_peer, _mult, pstate = self._evaluate_peer_policy_gate(callsign,
+                                                                                                 require_recent_rx_s)
+                        if not allow_peer:
+                            if defer:
+                                self._enqueue_pending_sync(peer_label=callsign, channel=channel, dest_node_id=node_id,
+                                                           last_n=last_n, reason=reason_peer or 'peer_gate')
+                                self._emit_status(f"Auto-sync deferred for {channel} from {callsign} ({pstate})")
+                            continue
                         if defer:
                             self._enqueue_pending_sync(peer_label=callsign, channel=channel, dest_node_id=node_id,
                                                        last_n=last_n, reason="auto_peer_deferred")
@@ -912,6 +945,14 @@ class MeshChatBackend(BackendInterface):
                                                last_n=last_n, reason="manual_dm_link_gate")
                 return
 
+            # Feature #5: peer-aware gate (derived; policy-only, no routing changes)
+            allow_peer, reason_peer, _mult, pstate = self._evaluate_peer_policy_gate(callsign, require_recent_rx_s)
+            if not allow_peer:
+                if defer:
+                    self._enqueue_pending_sync(peer_label=callsign, channel=channel, dest_node_id=node_id,
+                                               last_n=last_n, reason=reason_peer or 'peer_gate')
+                self._emit_status(f"Sync gated for {channel} from {callsign} ({pstate})")
+                return
             if defer:
                 self._enqueue_pending_sync(peer_label=callsign, channel=channel, dest_node_id=node_id, last_n=last_n,
                                            reason="manual_dm_deferred")
@@ -1142,6 +1183,94 @@ class MeshChatBackend(BackendInterface):
 
         return False
 
+    # ----------------------------------------------------------
+    # Feature #5: Offline peer awareness + soft link-cost (policy-only)
+    # ----------------------------------------------------------
+
+    def _peer_last_seen_age_s(self, peer_label: str) -> Optional[float]:
+        """Best-effort last-seen age for a peer (derived from discovery state).
+
+        Returns: Age in seconds since peer was last seen, or None if unknown/unavailable.
+
+        Notes:
+            - Derived only from existing discovery data (no protocol concepts).
+            - Best-effort: unknown peers return None to avoid surprising behavior changes.
+        """
+        now = time.time()
+        try:
+            disc = self._client.get_discovered_nodes()
+        except (AttributeError, OSError, ValueError, TypeError):
+            return None
+        if not isinstance(disc, dict):
+            return None
+        tup = disc.get(str(peer_label))
+        if not isinstance(tup, tuple) or len(tup) != 2:
+            return None
+        _node_id_b, last_seen = tup
+        if not isinstance(last_seen, (int, float)) or float(last_seen) <= 0:
+            return None
+        return max(0.0, now - float(last_seen))
+
+    def _peer_max_retry_attempts(self, peer_label: str) -> int:
+        """Best-effort max sync retry attempts currently tracked for this peer."""
+        peer = str(peer_label)
+        mx = 0
+        with self._sync_retry_lock:
+            items = list(self._sync_retry.items())
+        for (_k, st) in items:
+            try:
+                if str(getattr(st, 'peer_label', '')) != peer:
+                    continue
+                a = int(getattr(st, 'attempts', 0) or 0)
+                if a > mx:
+                    mx = a
+            except (TypeError, ValueError):
+                continue
+        return mx
+
+    def _evaluate_peer_policy_gate(self, peer_label: str, require_recent_rx_s: float) -> tuple[bool, str, float, str]:
+        """Evaluate peer reachability for policy gating only (no routing changes).
+
+        Returns: (allow, reason, backoff_mult, peer_state)
+
+        peer_state is derived/local-only: 'unknown', 'online', 'stale', 'likely_offline'.
+        """
+        if require_recent_rx_s <= 0.0:
+            return True, '', 1.0, 'unknown'
+
+        age = self._peer_last_seen_age_s(peer_label)
+        if age is None:
+            # Unknown peer freshness: do not block (best-effort).
+            return True, 'peer_unknown', 1.0, 'unknown'
+
+        # Derive a simple state from the existing policy window (no new config).
+        if age <= require_recent_rx_s:
+            return True, '', 1.0, 'online'
+        if age <= (require_recent_rx_s * 2.0):
+            return False, 'peer_stale', 1.5, 'stale'
+
+        attempts = self._peer_max_retry_attempts(peer_label)
+        if attempts > 0:
+            return False, 'peer_likely_offline_retrying', 2.0, 'likely_offline'
+        return False, 'peer_likely_offline', 2.0, 'likely_offline'
+
+    def _diagnostic_peer_window_s(self) -> Optional[float]:
+        """Derive a best-effort peer freshness window from existing channel policies."""
+        policies = getattr(self._config, 'sync_channel_policies', None)
+        if not isinstance(policies, list) or not policies:
+            return None
+        mx: Optional[float] = None
+        for p in policies:
+            try:
+                v = float(getattr(p, 'require_recent_rx_seconds', 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if v <= 0.0:
+                continue
+            if mx is None or v > mx:
+                mx = v
+        return mx
+
     def _enqueue_pending_sync(self, peer_label: str, channel: str, dest_node_id: bytes, last_n: int,
                               reason: str) -> None:
         key = (str(peer_label), str(channel))
@@ -1206,6 +1335,12 @@ class MeshChatBackend(BackendInterface):
             require_rx = self._policy_require_recent_rx(channel)
             if require_rx is not None and require_rx > 0:
                 if not self._links_usable_for_policy(float(require_rx)):
+                    continue
+
+            # Feature #5: peer-aware gate (derived; policy-only, no routing changes)
+            if require_rx is not None and float(require_rx) > 0.0:
+                allow_peer, _reason, _mult, _pstate = self._evaluate_peer_policy_gate(peer_label, float(require_rx))
+                if not allow_peer:
                     continue
 
             try:
@@ -1342,6 +1477,17 @@ class MeshChatBackend(BackendInterface):
                     st.next_due_ts = now + self._compute_backoff_seconds(st)
                     continue
 
+                # Feature #5: peer-aware gate (derived; policy-only, no routing changes)
+                if require_recent_rx_s > 0.0:
+                    allow_peer, reason_peer, mult, _pstate = self._evaluate_peer_policy_gate(st.peer_label,
+                                                                                             require_recent_rx_s)
+                    if not allow_peer:
+                        if self._policy_defer(st.channel):
+                            self._enqueue_pending_sync(peer_label=st.peer_label, channel=st.channel,
+                                                       dest_node_id=st.dest_node_id, last_n=int(st.last_n),
+                                                       reason=reason_peer or 'peer_gate')
+                        st.next_due_ts = now + (self._compute_backoff_seconds(st) * float(mult))
+                        continue
                 if self._policy_defer(st.channel):
                     self._enqueue_pending_sync(peer_label=st.peer_label, channel=st.channel,
                                                dest_node_id=st.dest_node_id, last_n=int(st.last_n),
