@@ -5,6 +5,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+import json
 from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple
 
@@ -307,6 +308,221 @@ class MeshChatBackend(BackendInterface):
     def _emit_status(self, text: str) -> None:
         self._ui_queue.put(StatusEvent(text=text))
 
+    # ----------------------------------------------------------
+    # Structured diagnostics (Feature #2)
+    # ----------------------------------------------------------
+
+    def _build_diagnostics_snapshot(self) -> dict:
+        """Build a machine-stable diagnostics snapshot from existing runtime data only."""
+        now = time.time()
+
+        # Node identity
+        callsign = str(getattr(getattr(self._config, "mesh_node_config", None), "callsign", "") or "")
+        try:
+            node_id = self._client.get_node_id()
+        except (AttributeError, OSError, ValueError, TypeError):
+            node_id = b""
+
+        startup_error = getattr(self._client, "_startup_error", None)
+        if not isinstance(startup_error, str) or not startup_error:
+            startup_error = ""
+
+        # Mesh routing state (best-effort introspection; no behavior changes)
+        originators_count = 0
+        neighbors_count = 0
+        try:
+            mesh_node = getattr(self._client, "_mesh_node", None)
+            state = getattr(mesh_node, "_routing_state", None)
+            originators = getattr(state, "originators", {}) if state is not None else {}
+            neighbors = getattr(state, "neighbors", {}) if state is not None else {}
+            if isinstance(originators, dict):
+                originators_count = len(originators)
+            if isinstance(neighbors, dict):
+                neighbors_count = len(neighbors)
+        except (AttributeError, TypeError, ValueError):
+            originators_count = 0
+            neighbors_count = 0
+
+        # Discovered nodes (existing API)
+        discovered_list: list[dict] = []
+        try:
+            disc = self._client.get_discovered_nodes()
+        except (AttributeError, OSError, ValueError, TypeError):
+            disc = {}
+
+        if isinstance(disc, dict):
+            for cs, tup in disc.items():
+                try:
+                    node_id_b, last_seen = tup
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(cs, str):
+                    continue
+                age_s = None
+                if isinstance(last_seen, (int, float)) and float(last_seen) > 0:
+                    age_s = max(0.0, now - float(last_seen))
+                discovered_list.append(
+                    {
+                        "callsign": cs,
+                        "node_id_hex": node_id_b.hex() if isinstance(node_id_b, (bytes, bytearray)) else "",
+                        "last_seen_age_s": age_s,
+                    }
+                )
+            discovered_list.sort(key=lambda d: str(d.get("callsign") or ""))
+
+        # Per-link metrics (Feature #1)
+        try:
+            link_metrics = self._client.get_link_metrics()
+        except (AttributeError, OSError, ValueError, TypeError):
+            link_metrics = []
+        if not isinstance(link_metrics, list):
+            link_metrics = []
+
+        # Sync / retry state (already present in backend)
+        retries: list[dict] = []
+        with self._sync_retry_lock:
+            items = list(self._sync_retry.items())
+        for (_k, st) in items:
+            try:
+                due_in_s = max(0.0, float(st.next_due_ts) - now)
+            except (TypeError, ValueError):
+                due_in_s = 0.0
+            retries.append(
+                {
+                    "peer_label": str(getattr(st, "peer_label", "") or ""),
+                    "channel": str(getattr(st, "channel", "") or ""),
+                    "attempts": int(getattr(st, "attempts", 0) or 0),
+                    "due_in_s": due_in_s,
+                    "gave_up": bool(getattr(st, "gave_up", False)),
+                    "last_n": int(getattr(st, "last_n", 0) or 0),
+                }
+            )
+        retries.sort(key=lambda d: (str(d.get("channel") or ""), str(d.get("peer_label") or "")))
+
+        # Local channels (from our cached view; derived from ChatStore via backend refresh)
+        local_channels = list(self._last_channels) if isinstance(self._last_channels, list) else []
+
+        snap = {
+            "diag_version": 1,
+            "ts": int(now),
+            "node": {
+                "callsign": callsign,
+                "node_id_hex": node_id.hex() if isinstance(node_id, (bytes, bytearray)) else "",
+                "startup_error": startup_error,
+            },
+            "mesh": {
+                "originators_count": int(originators_count),
+                "neighbors_count": int(neighbors_count),
+                "discovered_count": int(len(discovered_list)),
+                "discovered_nodes": discovered_list[:25],  # cap for RF readability
+            },
+            "links": link_metrics,
+            "sync": {
+                "cooldowns_tracked": int(len(self._last_sync_time)) if isinstance(self._last_sync_time, dict) else 0,
+                "retries_tracked": int(len(retries)),
+                "retries": retries[:25],  # cap
+            },
+            "db": {
+                "local_channels_count": int(len(local_channels)),
+                "local_channels": local_channels[:25],  # cap
+            },
+        }
+        return snap
+
+    @staticmethod
+    def _format_diagnostics_text(snap: dict) -> list[str]:
+        """Render a diagnostics snapshot as compact, RF-friendly lines."""
+        lines: list[str] = []
+        if not isinstance(snap, dict):
+            return lines
+
+        ts = snap.get("ts")
+        dv = snap.get("diag_version")
+        node = snap.get("node") if isinstance(snap.get("node"), dict) else {}
+        mesh = snap.get("mesh") if isinstance(snap.get("mesh"), dict) else {}
+        sync = snap.get("sync") if isinstance(snap.get("sync"), dict) else {}
+        db = snap.get("db") if isinstance(snap.get("db"), dict) else {}
+
+        callsign = str(node.get("callsign") or "")
+        node_hex = str(node.get("node_id_hex") or "")
+        startup_err = str(node.get("startup_error") or "")
+
+        lines.append(f"DIAG v{dv} ts={ts} callsign={callsign} node_id={node_hex}")
+        if startup_err:
+            cleaned = " ".join(startup_err.split())
+            if len(cleaned) > 160:
+                cleaned = cleaned[:157] + "..."
+            lines.append(f"NODE startup_error=\"{cleaned}\"")
+
+        lines.append(
+            "MESH "
+            f"discovered={int(mesh.get('discovered_count', 0) or 0)} "
+            f"originators={int(mesh.get('originators_count', 0) or 0)} "
+            f"neighbors={int(mesh.get('neighbors_count', 0) or 0)}"
+        )
+
+        # Discovered nodes (callsign + age)
+        dn = mesh.get("discovered_nodes")
+        if isinstance(dn, list) and dn:
+            parts = []
+            for d in dn[:10]:
+                if not isinstance(d, dict):
+                    continue
+                cs = str(d.get("callsign") or "")
+                age = d.get("last_seen_age_s")
+                if cs:
+                    if isinstance(age, (int, float)):
+                        parts.append(f"{cs}({float(age):.0f}s)")
+                    else:
+                        parts.append(cs)
+            if parts:
+                lines.append("NODES " + " ".join(parts))
+
+        # DB channels
+        ch = db.get("local_channels")
+        if isinstance(ch, list) and ch:
+            shown = [str(x) for x in ch[:10] if str(x)]
+            if shown:
+                lines.append("DB channels=" + ",".join(shown))
+
+        # Sync state
+        lines.append(
+            "SYNC "
+            f"cooldowns={int(sync.get('cooldowns_tracked', 0) or 0)} "
+            f"retries={int(sync.get('retries_tracked', 0) or 0)}"
+        )
+        rlist = sync.get("retries")
+        if isinstance(rlist, list) and rlist:
+            for r in rlist[:10]:
+                if not isinstance(r, dict):
+                    continue
+                peer = str(r.get("peer_label") or "")
+                chan = str(r.get("channel") or "")
+                att = int(r.get("attempts", 0) or 0)
+                due = r.get("due_in_s")
+                gu = bool(r.get("gave_up", False))
+                due_s = f"{float(due):.1f}s" if isinstance(due, (int, float)) else "?"
+                lines.append(f"RETRY peer={peer} chan={chan} attempts={att} due_in={due_s} gave_up={1 if gu else 0}")
+
+        return lines
+
+    @staticmethod
+    def _format_diagnostics_json(snap: dict) -> str:
+        """Render snapshot as a single stable JSON line."""
+        try:
+            return json.dumps(snap, sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return "{}"
+
+    def _emit_structured_diagnostics(self) -> None:
+        """Emit structured diagnostics to the UI queue as StatusEvents (text + JSON)."""
+        snap = self._build_diagnostics_snapshot()
+        for line in self._format_diagnostics_text(snap):
+            self._emit_status(line)
+
+        # Machine-stable one-liner for parsing/log collection
+        self._emit_status("DIAG_JSON " + self._format_diagnostics_json(snap))
+
     @staticmethod
     def _format_link_metrics(m: dict) -> str:
         """Format a best-effort per-link metrics snapshot into a single status line.
@@ -367,6 +583,8 @@ class MeshChatBackend(BackendInterface):
 
         # Multiplex links may include nested per-link metrics.
         child_links = m.get("child_links")
+        if child_links is None:
+            child_links = m.get("links")
         if isinstance(child_links, list) and child_links:
             # Summarize connection state without spamming the status window.
             states = []
@@ -534,7 +752,9 @@ class MeshChatBackend(BackendInterface):
             time.sleep(self._status_interval)
             if not self._running:
                 return
-            self._emit_status("MeshChat backend heartbeat.")
+
+            # Feature #2: structured diagnostics snapshot (human + machine stable)
+            self._emit_structured_diagnostics()
 
             # Per-link health/metrics snapshot (best-effort, no protocol changes)
             try:
@@ -544,10 +764,6 @@ class MeshChatBackend(BackendInterface):
 
             for m in metrics_list:
                 self._emit_status(self._format_link_metrics(m))
-
-    # ----------------------------------------------------------
-    # Node/Channel state -> UI
-    # ----------------------------------------------------------
 
     def _nodes_loop(self) -> None:
         """Periodically snapshot routing state and notify the GUI."""
