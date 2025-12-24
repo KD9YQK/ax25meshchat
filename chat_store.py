@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Callable, Dict, Any
 
 
 class ChatStore:
@@ -18,8 +18,17 @@ class ChatStore:
     def __init__(self, db_path: str) -> None:
         self._db_path = db_path
         self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        # Optional local-only hook: called after a message is successfully stored.
+        self._on_message_stored: Optional[Callable[[Dict[str, Any]], None]] = None
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._init_schema()
+
+    def set_on_message_stored(self, cb: Optional[Callable[[Dict[str, Any]], None]]) -> None:
+        """Set a callback invoked after add_message stores a new row.
+
+        Callback receives a dict with existing fields only.
+        """
+        self._on_message_stored = cb
 
     def _init_schema(self) -> None:
         create_sql = """
@@ -81,11 +90,29 @@ class ChatStore:
             (origin_id, seqno, channel, nick, text, ts, created_ts)
         VALUES (?, ?, ?, ?, ?, ?, ?);
         """
-        self._conn.execute(
+        cur = self._conn.execute(
             insert_sql,
             (origin_id, int(seqno), channel, nick, text, float(ts), int(created_ts)),
         )
         self._conn.commit()
+
+        # Fire hook only when a new row was inserted (not a deduped IGNORE).
+        if cur.rowcount == 1 and self._on_message_stored is not None:
+            try:
+                self._on_message_stored(
+                    {
+                        "origin_id": origin_id,
+                        "seqno": int(seqno),
+                        "channel": channel,
+                        "nick": nick,
+                        "text": text,
+                        "ts": float(ts),
+                        "created_ts": int(created_ts),
+                    }
+                )
+            except Exception:
+                # Store must remain robust even if a hook misbehaves.
+                pass
 
     def has_message(self, origin_id: bytes, seqno: int) -> bool:
         sql = """

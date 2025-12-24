@@ -335,6 +335,92 @@ If a mode is not explicitly set, node behavior is unchanged.
 
 ---
 
+### Feature #4 — Channel-Scoped Sync Policies (Including Deferred / Opportunistic Sync)
+
+Sync behavior can be **gated and tuned per channel** using existing sync mechanisms (no new packet types).
+
+This allows operators to apply different strategies based on channel purpose and bandwidth constraints, such as:
+
+- **Eager / normal** sync for high-value channels
+- **Deferred / opportunistic** sync for low-priority channels (repair gaps when convenient)
+- Policy-only gating that avoids initiating sync in restricted roles/modes
+
+Key properties:
+
+- **No protocol changes**
+- **No routing/forwarding changes**
+- Uses existing sync request/response behavior; only **local policy** decides when to initiate/accept sync
+
+This preserves RF realism while making the system more manageable at scale.
+
+---
+
+### Feature #5 — Offline Peer Awareness + Soft Link-Cost (Policy-Only)
+
+The system derives **peer reachability** (“online/offline/uncertain”) from **existing signals** only, such as:
+
+- recent OGMs / traffic observation
+- per-link activity timestamps and health metrics
+
+On top of that, a **soft link-cost** mechanism can influence **local policy decisions** (for example: which links to prefer for initiating certain actions) without changing routing or introducing new protocol fields.
+
+Key properties:
+
+- **Derived, observational reachability**
+- **Soft cost is gating/preference only**
+- **No routing changes**
+- **No multiplex behavior changes**
+- **No protocol changes**
+
+This helps operators understand “who’s really around” and keeps expensive operations from firing blindly on poor paths.
+
+---
+
+### Feature #6 — Message Expiry & Retention Policy (Local-Only)
+
+To prevent unbounded SQLite growth, the system supports **local-only retention controls**.
+
+Characteristics:
+
+- Disabled by default (conservative)
+- Retention is **policy-driven** and **explicit**
+- Pruning can be executed via the existing manual path, and retention policies can optionally automate local cleanup
+- Expired messages are simply absent locally; **nothing is signaled to peers**
+
+Key properties:
+
+- **No protocol changes**
+- **No sync behavior changes**
+- **No routing/forwarding changes**
+- Strictly affects local storage and local UX
+
+---
+
+### Feature #7 — Event Hooks / Plugins (Local-Only Extensibility)
+
+The system provides an **optional plugin hook mechanism** so operators can observe (and optionally react to) internal events **without modifying core logic**.
+
+Plugins are:
+
+- **Local-only**
+- **Optional**
+- **Disabled by default** (no `./plugins/` means no plugins)
+- **Safe**: plugin exceptions are isolated; plugins cannot crash the mesh
+- **Non-blocking**: events are queued and delivered on a background worker so RF-critical paths are protected
+
+Typical event hooks include:
+
+- `on_message_sent`
+- `on_message_received`
+- `on_message_stored`
+- `on_gap_detected`
+- `on_sync_applied`
+- `on_prune_executed`
+- `on_link_state_change`
+
+Plugins live in `./plugins/` and can implement per-event handler functions and/or a catch-all handler.
+
+See: `plugin.md`
 
 ---
 

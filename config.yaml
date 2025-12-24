@@ -71,7 +71,7 @@ gui:
     list: 14
 tcp_mesh:
   server:
-    enabled: false
+    enabled: true
     server_pw: password
     server_port: 9000
   links:

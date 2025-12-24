@@ -444,6 +444,7 @@ class MeshChatClient:
             on_chat_message: Callable[[ChatMessage, bytes, float], None],
             on_sync_applied: Optional[Callable[[str, int], None]] = None,
             on_gap_report: Optional[Callable[[str], None]] = None,
+            on_event: Optional[Callable[[str, Dict[str, object]], None]] = None,
     ) -> None:
         """
         on_chat_message(ChatMessage, origin_id, created_ts)
@@ -457,10 +458,26 @@ class MeshChatClient:
         self._on_chat_message = on_chat_message
         self._on_sync_applied = on_sync_applied
         self._on_gap_report = on_gap_report
+        self._on_event = on_event
         self._gap_tracker = _GapTracker()
         self._nick = config.mesh_node_config.callsign  # default nick
 
         self._store = ChatStore(config.db_path)
+        # Local-only hook (Feature #7): notify when a new message is stored.
+        if hasattr(self._store, "set_on_message_stored") and callable(getattr(self._store, "set_on_message_stored")):
+            def _store_hook(ev: Dict[str, object]) -> None:
+                cb = self._on_event
+                if cb is None:
+                    return
+                try:
+                    origin_b = ev.get("origin_id")
+                    if isinstance(origin_b, (bytes, bytearray)):
+                        ev = dict(ev)
+                        ev["origin_id_hex"] = bytes(origin_b).hex()
+                    cb("on_message_stored", ev)
+                except Exception:
+                    return
+            self._store.set_on_message_stored(_store_hook)
 
         self._link_client = None  # set by link_client_factory
 
@@ -633,6 +650,22 @@ class MeshChatClient:
         )
         payload = encode_chat_message(msg)
         data_seqno = self._mesh_node.send_application_data(dest_node_id, payload)
+        if self._on_event is not None:
+            try:
+                self._on_event(
+                    "on_message_sent",
+                    {
+                        "dest_node_id_hex": bytes(dest_node_id).hex(),
+                        "channel": channel,
+                        "nick": self._nick,
+                        "text": text,
+                        "origin_id_hex": self.get_node_id().hex(),
+                        "seqno": int(data_seqno),
+                        "created_ts": int(msg.created_ts),
+                    },
+                )
+            except Exception:
+                pass
         # Log locally as "sent" (if enabled for this role)
         if self._can_store_chat():
             now = time.time()
@@ -870,6 +903,21 @@ class MeshChatClient:
             msg: ChatMessage,
             recv_ts: float,
     ) -> None:
+        if self._on_event is not None:
+            try:
+                self._on_event(
+                    "on_message_received",
+                    {
+                        "origin_id_hex": bytes(origin_id).hex(),
+                        "seqno": int(data_seqno),
+                        "channel": msg.channel,
+                        "nick": msg.nick,
+                        "text": msg.text,
+                        "created_ts": int(getattr(msg, "created_ts", int(recv_ts))),
+                    },
+                )
+            except Exception:
+                pass
         if self._can_store_chat():
             self._store.add_message(
                 origin_id=origin_id,
