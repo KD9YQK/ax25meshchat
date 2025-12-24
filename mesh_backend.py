@@ -16,6 +16,7 @@ from chat_client import (
     MeshChatConfig,
     ChatMessage,
 )
+from plugin_manager import PluginManager
 
 
 # ============================================================
@@ -138,6 +139,11 @@ class MeshChatBackend(BackendInterface):
         """
         self._config = config
 
+        # Feature #7: optional local-only event hooks/plugins (disabled unless plugins are installed).
+        self._plugin_mgr = PluginManager(plugins_dir="plugins")
+        self._plugin_mgr.start()
+        self._last_link_states: Dict[str, bool] = {}
+
         # Feature #6: message retention (local-only). Defaults preserve behavior.
         self._retention_enabled = bool(getattr(config, "retention_enabled", False))
         self._retention_days = int(getattr(config, "retention_days", 0) or 0)
@@ -176,6 +182,7 @@ class MeshChatBackend(BackendInterface):
             on_chat_message=self._on_chat_message,
             on_sync_applied=self._on_sync_applied,
             on_gap_report=self._on_gap_report,
+            on_event=self._emit_plugin_event,
         )
 
         # Run MeshChatClient.start() in its own thread
@@ -297,6 +304,10 @@ class MeshChatBackend(BackendInterface):
         self._running = False
         self._emit_status("Shutting down MeshChat backend...")
         self._client.stop()
+        try:
+            self._plugin_mgr.stop()
+        except Exception:
+            pass
         # No explicit join() needed for daemon threads,
         # but you can add it for debugging if you want:
         # self._client_thread.join(timeout=2.0)
@@ -336,6 +347,17 @@ class MeshChatBackend(BackendInterface):
     def _emit_status(self, text: str) -> None:
         self._ui_queue.put(StatusEvent(text=text))
 
+    def _emit_plugin_event(self, name: str, data: Optional[Dict[str, object]] = None) -> None:
+        pm = getattr(self, "_plugin_mgr", None)
+        if pm is None or not getattr(pm, "is_enabled", lambda: False)():
+            return
+        try:
+            payload = dict(data or {})
+            pm.emit(name, **payload)
+        except Exception:
+            # Plugins must never affect mesh operation.
+            return
+
     # ----------------------------------------------------------
     # Structured diagnostics (Feature #2)
     # ----------------------------------------------------------
@@ -343,6 +365,12 @@ class MeshChatBackend(BackendInterface):
     def _build_diagnostics_snapshot(self) -> dict:
         """Build a machine-stable diagnostics snapshot from existing runtime data only."""
         now = time.time()
+
+        # Feature #7: local-only plugins (presence implies enabled).
+        plugins = {
+            "enabled": bool(getattr(self._plugin_mgr, "is_enabled", lambda: False)()),
+            "loaded": list(getattr(self._plugin_mgr, "get_loaded_plugins", lambda: [])()),
+        }
 
         # Node identity
         callsign = str(getattr(getattr(self._config, "mesh_node_config", None), "callsign", "") or "")
@@ -475,6 +503,7 @@ class MeshChatBackend(BackendInterface):
                 "peer_freshness_window_s": self._diagnostic_peer_window_s(),
             },
             "links": link_metrics,
+            "plugins": plugins,
             "retention": {
                 "enabled": bool(self._retention_enabled),
                 "days": int(self._retention_days),
@@ -590,6 +619,39 @@ class MeshChatBackend(BackendInterface):
         # Machine-stable one-liner for parsing/log collection
         self._emit_status("DIAG_JSON " + self._format_diagnostics_json(snap))
 
+    def _detect_link_state_changes(self) -> None:
+        """Detect link connect/disconnect transitions from existing per-link metrics only."""
+        try:
+            metrics_list = self._client.get_link_metrics()
+        except (AttributeError, OSError, ValueError, TypeError):
+            return
+
+        flat: List[Dict[str, object]] = []
+        for m in metrics_list:
+            if isinstance(m, dict) and m.get("link_type") == "multiplex":
+                links = m.get("links")
+                if isinstance(links, list):
+                    for lm in links:
+                        if isinstance(lm, dict):
+                            flat.append(lm)
+                continue
+            if isinstance(m, dict):
+                flat.append(m)
+
+        for m in flat:
+            name = str(m.get("name") or m.get("link_type") or "link")
+            connected = bool(m.get("connected"))
+            prev = self._last_link_states.get(name)
+            if prev is None:
+                self._last_link_states[name] = connected
+                continue
+            if bool(prev) != connected:
+                self._last_link_states[name] = connected
+                self._emit_plugin_event(
+                    "on_link_state_change",
+                    {"name": name, "connected": bool(connected)},
+                )
+
     @staticmethod
     def _format_link_metrics(m: dict) -> str:
         """Format a best-effort per-link metrics snapshot into a single status line.
@@ -678,6 +740,7 @@ class MeshChatBackend(BackendInterface):
     def _on_sync_applied(self, channel: str, applied_count: int) -> None:
         """Callback from MeshChatClient when a SYNC_RESPONSE is applied to the DB."""
         self._emit_status(f"Sync applied for {channel}: {applied_count} new message(s)")
+        self._emit_plugin_event("on_sync_applied", {"channel": channel, "applied_count": int(applied_count)})
         if applied_count > 0:
             self._clear_sync_retries_for_channel(channel)
         # Sync can introduce new channels/DMs; refresh left-list.
@@ -693,6 +756,7 @@ class MeshChatBackend(BackendInterface):
           - Rate-limit to stay polite on RF.
         """
         self._emit_status(text)
+        self._emit_plugin_event("on_gap_detected", {"text": text})
 
         # In non-full roles we observe gaps but do not initiate targeted sync.
         if not self._can_initiate_sync():
@@ -849,6 +913,8 @@ class MeshChatBackend(BackendInterface):
 
         if deleted > 0:
             self._emit_status(f"Retention: pruned {deleted} msgs older than {self._retention_days}d")
+            self._emit_plugin_event("on_prune_executed", {"mode": "retention_days", "deleted": int(deleted),
+                                                          "days": int(self._retention_days)})
 
     def _status_loop(self) -> None:
         while self._running:
@@ -858,6 +924,7 @@ class MeshChatBackend(BackendInterface):
 
             # Feature #2: structured diagnostics snapshot (human + machine stable)
             self._emit_structured_diagnostics()
+            self._detect_link_state_changes()
 
             # Feature #6: local retention maintenance (optional)
             self._maybe_run_retention_maintenance()
@@ -1070,6 +1137,8 @@ class MeshChatBackend(BackendInterface):
             return
 
         self._emit_status(f"DB pruned: deleted {deleted} rows (kept last {keep_last_n} per channel).")
+        self._emit_plugin_event("on_prune_executed", {"mode": "keep_last_n_per_channel", "deleted": int(deleted),
+                                                      "keep_last_n": int(keep_last_n)})
         self._refresh_channels_from_db()
 
     def _emit_initial_channels(self) -> None:
